@@ -1,11 +1,12 @@
-//! `llmprobe` binary entry point: parse CLI → `RunConfig` → run → exit code.
+//! `llmprobe` binary entry point.
 
 use clap::Parser;
 use llmprobe::cli::Args;
 use llmprobe::config::RunConfig;
-use llmprobe::metrics::{Report, aggregate};
+use llmprobe::metrics::aggregate;
+use llmprobe::persist;
 use llmprobe::report;
-use llmprobe::runner::{BatchResult, run_batch};
+use llmprobe::runner::run_grow;
 use std::io::IsTerminal;
 use std::process::ExitCode;
 
@@ -13,73 +14,140 @@ use std::process::ExitCode;
 async fn main() -> ExitCode {
     let args = Args::parse();
 
-    // A.13: `--tui` always parses; reject it on a build without the feature.
+    let json = args.json;
+    let color = !json
+        && !args.no_color
+        && std::env::var_os("NO_COLOR").is_none()
+        && std::io::stdout().is_terminal();
+
+    // ── Replay mode: load file and display without running anything ──────────
+    if let Some(ref path) = args.replay {
+        let result = match persist::load(path) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("error: {e}");
+                return ExitCode::from(1);
+            }
+        };
+
+        #[cfg(feature = "tui")]
+        if args.tui {
+            match llmprobe::tui::replay(&result).await {
+                Ok(()) => {}
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    return ExitCode::from(1);
+                }
+            }
+            if json {
+                match report::render_json(&result) {
+                    Ok(s) => println!("{s}"),
+                    Err(e) => {
+                        eprintln!("error: {e}");
+                        return ExitCode::from(1);
+                    }
+                }
+            } else {
+                print!("{}", report::render(&result, color));
+            }
+            return ExitCode::from(0);
+        }
+
+        if json {
+            match report::render_json(&result) {
+                Ok(s) => println!("{s}"),
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    return ExitCode::from(1);
+                }
+            }
+        } else {
+            print!("{}", report::render(&result, color));
+        }
+        return ExitCode::from(0);
+    }
+
+    // ── Live run ─────────────────────────────────────────────────────────────
+    let url = match &args.url {
+        Some(u) => u.as_str(),
+        None => {
+            eprintln!("error: --url is required unless --replay is given");
+            return ExitCode::from(1);
+        }
+    };
+    let model = match args.model {
+        Some(m) => m,
+        None => {
+            eprintln!("error: --model is required unless --replay is given");
+            return ExitCode::from(1);
+        }
+    };
+
+    let cfg = match RunConfig::build(
+        url,
+        model,
+        args.conversations,
+        args.concurrency,
+        args.stream,
+        args.prompt,
+        args.turn,
+        args.max_turns,
+        args.max_tokens,
+        args.temperature,
+        args.timeout,
+        args.api_key,
+        &args.headers,
+        &args.messages,
+    ) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return ExitCode::from(1);
+        }
+    };
+
     #[cfg(not(feature = "tui"))]
     if args.tui {
         eprintln!("error: this build has no TUI support; rebuild with --features tui");
         return ExitCode::from(1);
     }
 
-    let json = args.json;
-    // Color: off for JSON, off unless stdout is a TTY, honored by --no-color and
-    // the NO_COLOR convention (A.12).
-    let color = !json
-        && !args.no_color
-        && std::env::var_os("NO_COLOR").is_none()
-        && std::io::stdout().is_terminal();
-
-    let cfg = match RunConfig::build(
-        &args.url,
-        args.model,
-        args.requests,
-        args.concurrency,
-        args.stream,
-        args.prompt,
-        args.max_tokens,
-        args.temperature,
-        args.timeout,
-        args.warmup,
-        args.api_key,
-        &args.headers,
-        &args.messages,
-    ) {
-        Ok(cfg) => cfg,
-        Err(e) => {
-            eprintln!("error: {e}");
-            return ExitCode::from(1);
-        }
-    };
-
-    // TUI path (feature-gated): the dashboard runs the batch and returns the
-    // same BatchResult, then we fall through to the shared report + exit code.
-    let batch_result = if args.tui {
+    let result = if args.tui {
         #[cfg(feature = "tui")]
         {
-            llmprobe::tui::run(&cfg).await
+            match llmprobe::tui::run(&cfg).await {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    return ExitCode::from(1);
+                }
+            }
         }
         #[cfg(not(feature = "tui"))]
         {
-            unreachable!("--tui rejected earlier on no-feature builds")
+            unreachable!("--tui rejected above")
         }
     } else {
-        run_batch(&cfg, None, None).await
-    };
-
-    let BatchResult {
-        outcomes,
-        wall_clock,
-    } = match batch_result {
-        Ok(res) => res,
-        Err(e) => {
-            eprintln!("error: {e}");
-            return ExitCode::from(1);
+        match run_grow(&cfg, None, None).await {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("error: {e}");
+                return ExitCode::from(1);
+            }
         }
     };
 
-    let summary = aggregate(&outcomes, wall_clock);
+    // Optional save.
+    if let Some(ref path) = args.output {
+        if let Err(e) = persist::save(path, &result) {
+            eprintln!("warning: could not save output: {e}");
+        }
+    }
+
+    let summary = aggregate(&result);
 
     if json {
-        match report::render_json(&summary, &cfg) {
+        match report::render_json(&result) {
             Ok(s) => println!("{s}"),
             Err(e) => {
                 eprintln!("error: failed to serialize report: {e}");
@@ -87,18 +155,17 @@ async fn main() -> ExitCode {
             }
         }
     } else {
-        print!("{}", report::render(&summary, &cfg, color));
+        print!("{}", report::render(&result, color));
     }
 
     exit_code(&summary)
 }
 
-/// Exit code per §8: `0` all ok, `1` total failure, `2` partial failure.
-fn exit_code(report: &Report) -> ExitCode {
-    if report.total > 0 && report.ok == 0 {
+fn exit_code(report: &llmprobe::metrics::RunReport) -> ExitCode {
+    if report.conversations.total > 0 && report.conversations.errors == report.conversations.total {
         return ExitCode::from(1);
     }
-    if report.failed > 0 {
+    if report.conversations.errors > 0 {
         return ExitCode::from(2);
     }
     ExitCode::from(0)
