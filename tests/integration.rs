@@ -38,6 +38,7 @@ fn cfg(base_url: &str, requests: usize, concurrency: usize, stream: bool) -> Run
         0,
         None,
         &[],
+        &[],
     )
     .expect("valid config")
 }

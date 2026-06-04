@@ -63,6 +63,12 @@ pub struct Args {
     #[arg(short = 'H', long = "header")]
     pub headers: Vec<String>,
 
+    /// Conversation turn in 'role: content' form (repeatable, in order).
+    /// When present, overrides --prompt and lets you build a multi-turn context,
+    /// e.g. -M "user: hi" -M "assistant: hello" -M "user: follow up".
+    #[arg(short = 'M', long = "message")]
+    pub messages: Vec<String>,
+
     /// Live dashboard (requires the `tui` feature).
     #[arg(long)]
     pub tui: bool,

@@ -797,9 +797,17 @@ fn draw_detail(frame: &mut ratatui::Frame, state: &TuiState, cfg: &RunConfig) {
 
 /// Pretty-print the JSON body llmprobe sends (the same for every request).
 fn request_json(cfg: &RunConfig) -> String {
+    let msgs: Vec<serde_json::Value> = if cfg.messages.is_empty() {
+        vec![serde_json::json!({ "role": "user", "content": cfg.prompt })]
+    } else {
+        cfg.messages
+            .iter()
+            .map(|(role, content)| serde_json::json!({ "role": role, "content": content }))
+            .collect()
+    };
     let mut body = serde_json::json!({
         "model": cfg.model,
-        "messages": [{ "role": "user", "content": cfg.prompt }],
+        "messages": msgs,
         "max_tokens": cfg.max_tokens,
         "stream": cfg.stream,
     });

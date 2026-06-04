@@ -41,6 +41,7 @@ async fn main() -> ExitCode {
         args.warmup,
         args.api_key,
         &args.headers,
+        &args.messages,
     ) {
         Ok(cfg) => cfg,
         Err(e) => {
