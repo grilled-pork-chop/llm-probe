@@ -1,45 +1,57 @@
-//! Command-line surface (§10 / A.3).
-//!
-//! The full flag set is declared up front so scripts don't break across builds
-//! (e.g. `--tui` always parses; A.13). Flags are wired up over phases 1–6.
+//! Command-line surface.
 
 use clap::Parser;
 
-/// Default prompt (A.3): a short, fixed user message.
+/// Default first user message when no -M flags are given.
 pub const DEFAULT_PROMPT: &str = "Write three sentences about the history of computing.";
+
+/// Default follow-up message appended every turn to grow the conversation.
+pub const DEFAULT_TURN: &str = "Please continue.";
 
 #[derive(Debug, Parser)]
 #[command(
     name = "llmprobe",
-    about = "Smoke-test an OpenAI-compatible chat endpoint",
+    about = "Grow conversations to the context limit on an OpenAI-compatible chat endpoint",
+    long_about = "Runs C concurrent conversation slots (-c), each growing a conversation \
+turn-by-turn until the server refuses with a context-length error. \
+Collect TTFT, TPOT, TPS, and context-window stats per turn, per conversation, \
+and in aggregate. Save runs with --output and replay them interactively with --replay.",
     version
 )]
 pub struct Args {
-    /// Base or full endpoint. If it doesn't end in /chat/completions, that path is appended.
-    #[arg(short, long)]
-    pub url: String,
+    /// Base or full endpoint. Appends /v1/chat/completions if absent.
+    #[arg(short, long, required_unless_present = "replay")]
+    pub url: Option<String>,
 
     /// Model name.
-    #[arg(short, long)]
-    pub model: String,
+    #[arg(short, long, required_unless_present = "replay")]
+    pub model: Option<String>,
 
-    /// Number of requests; 0 (the default) runs indefinitely until interrupted.
-    #[arg(short = 'n', long, default_value_t = 0)]
-    pub requests: usize,
+    /// Total conversations to complete across all slots; 0 = run forever.
+    #[arg(short = 'n', long = "conversations", default_value_t = 0)]
+    pub conversations: usize,
 
-    /// Max in-flight requests.
+    /// Concurrent conversation slots (virtual users).
     #[arg(short, long, default_value_t = 1)]
     pub concurrency: usize,
 
-    /// Enable streaming + TTFT measurement.
+    /// Enable streaming (measures TTFT and TPOT; strongly recommended).
     #[arg(long)]
     pub stream: bool,
 
-    /// Prompt text.
+    /// Initial user message (seed for every conversation).
     #[arg(short, long, default_value = DEFAULT_PROMPT)]
     pub prompt: String,
 
-    /// Cap output tokens.
+    /// User message appended every grow step. Defaults to "Please continue."
+    #[arg(long, default_value = DEFAULT_TURN)]
+    pub turn: String,
+
+    /// Stop a conversation after this many turns regardless of context limit (0 = unlimited).
+    #[arg(long = "max-turns", default_value_t = 0)]
+    pub max_turns: usize,
+
+    /// Cap output tokens per turn.
     #[arg(long, default_value_t = 128)]
     pub max_tokens: u32,
 
@@ -47,13 +59,9 @@ pub struct Args {
     #[arg(long)]
     pub temperature: Option<f32>,
 
-    /// Per-request timeout in seconds.
-    #[arg(long, default_value_t = 30)]
+    /// Per-turn request timeout in seconds.
+    #[arg(long, default_value_t = 60)]
     pub timeout: u64,
-
-    /// Discard the first K requests to exclude cold-start skew.
-    #[arg(long, default_value_t = 0)]
-    pub warmup: usize,
 
     /// Bearer token (falls back to $OPENAI_API_KEY).
     #[arg(long, env = "OPENAI_API_KEY")]
@@ -63,21 +71,28 @@ pub struct Args {
     #[arg(short = 'H', long = "header")]
     pub headers: Vec<String>,
 
-    /// Conversation turn in 'role: content' form (repeatable, in order).
-    /// When present, overrides --prompt and lets you build a multi-turn context,
-    /// e.g. -M "user: hi" -M "assistant: hello" -M "user: follow up".
+    /// Seed conversation turn in 'role: content' form (repeatable, in order).
+    /// When given, overrides --prompt.
     #[arg(short = 'M', long = "message")]
     pub messages: Vec<String>,
 
-    /// Live dashboard (requires the `tui` feature).
+    /// Live TUI dashboard (requires the `tui` feature).
     #[arg(long)]
     pub tui: bool,
 
-    /// Machine-readable report.
+    /// Machine-readable JSON report.
     #[arg(long)]
     pub json: bool,
 
-    /// Disable ANSI color.
+    /// Disable ANSI colour.
     #[arg(long)]
     pub no_color: bool,
+
+    /// Write the completed run to FILE as JSON (can be reopened with --replay).
+    #[arg(long)]
+    pub output: Option<String>,
+
+    /// Load a saved run from FILE and open the interactive view (no HTTP requests made).
+    #[arg(long, conflicts_with_all = ["url", "model"])]
+    pub replay: Option<String>,
 }

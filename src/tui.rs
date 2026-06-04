@@ -1,14 +1,12 @@
-//! Live `htop`/`btop`-style dashboard (`--tui`, `#[cfg(feature = "tui")]`).
-//!
-//! The TUI consumes the *same* `RunEvent`/`RequestOutcome` stream as plain mode
-//! (§9), so the numbers cannot diverge. Terminal setup is wrapped in a RAII
-//! guard whose `Drop` restores the screen; a panic hook restores first too, so a
-//! crash or `Ctrl-C` never leaves the shell wrecked.
+//! Live grow-mode dashboard (`--tui`, `#[cfg(feature = "tui")]`).
 
 use crate::config::RunConfig;
 use crate::error::ProbeError;
-use crate::metrics::{Report, RequestOutcome, aggregate};
-use crate::runner::{BatchResult, RunEvent, run_batch};
+use crate::metrics::{
+    aggregate, mean, ConfigSnapshot, ConversationOutcome, GrowResult, RunReport, TerminalReason,
+    TurnOutcome,
+};
+use crate::runner::{RunEvent, run_grow};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
@@ -20,11 +18,11 @@ use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
-    BarChart, Block, BorderType, Borders, Cell, Clear, Gauge, Padding, Paragraph, Row, Sparkline,
-    Table, TableState, Wrap,
+    Block, BorderType, Borders, Cell, Clear, Padding, Paragraph, Row, Sparkline, Table, TableState,
+    Wrap,
 };
 use std::collections::{BTreeMap, VecDeque};
-use std::io::{self};
+use std::io;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::unbounded_channel;
 use tokio::sync::watch;
@@ -32,15 +30,10 @@ use tokio::sync::watch;
 const ACCENT: Color = Color::Cyan;
 const TICK: Duration = Duration::from_millis(80);
 const SPARK_LEN: usize = 60;
-const MAX_ROWS: usize = 200;
-/// Most recent request rows kept for the list/inspector (bounds memory when
-/// running indefinitely; far exceeds any sane concurrency so in-flight rows
-/// are never evicted before they finish).
-const KEEP_ROWS: usize = 1_000;
-/// Most recent outcomes kept for the live stats window when running forever.
-const KEEP_OUTCOMES: usize = 5_000;
+const MAX_CONV_ROWS: usize = 500;
 
-/// Restores the terminal on drop (normal return *or* unwind).
+// ── Terminal guard ────────────────────────────────────────────────────────────
+
 struct TerminalGuard;
 
 impl TerminalGuard {
@@ -62,236 +55,122 @@ fn io_err(e: io::Error) -> ProbeError {
     ProbeError::Stream(format!("terminal error: {e}"))
 }
 
-/// Run the dashboard to completion (or until the user quits) and return the
-/// batch outcomes so the caller can print the §8 report after restoring.
-pub async fn run(cfg: &RunConfig) -> Result<BatchResult, ProbeError> {
-    // Restore the terminal before re-raising any panic.
-    let prev_hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |info| {
-        let _ = disable_raw_mode();
-        let _ = execute!(io::stdout(), LeaveAlternateScreen);
-        prev_hook(info);
-    }));
+// ── State types ───────────────────────────────────────────────────────────────
 
-    let _guard = TerminalGuard::enter()?;
-    let backend = CrosstermBackend::new(io::stdout());
-    let mut terminal = Terminal::new(backend).map_err(io_err)?;
-
-    // Spawn the batch; it streams events back over `run_rx`. `pause_tx` gates
-    // dispatch so `space`/`p` can pause sending new requests.
-    let (run_tx, mut run_rx) = unbounded_channel::<RunEvent>();
-    let (pause_tx, pause_rx) = watch::channel(false);
-    let cfg_task = cfg.clone();
-    let mut batch =
-        tokio::spawn(async move { run_batch(&cfg_task, Some(run_tx), Some(pause_rx)).await });
-
-    // Blocking key reader on its own thread (A.14): no `event-stream` feature.
-    let (key_tx, mut key_rx) = unbounded_channel::<Event>();
-    std::thread::spawn(move || {
-        while let Ok(ev) = event::read() {
-            if key_tx.send(ev).is_err() {
-                break;
-            }
-        }
-    });
-
-    let mut state = TuiState::new(cfg.requests);
-    let mut ticker = tokio::time::interval(TICK);
-    // The runner's authoritative result (correct wall-clock), captured when the
-    // batch task finishes. `None` until then.
-    let mut batch_result: Option<Result<BatchResult, ProbeError>> = None;
-
-    // The loop exits only when the user quits (q / Esc / Ctrl-C). On completion
-    // the dashboard stays up showing the frozen final frame (§9), so a fast or
-    // instantly-failing run is still visible instead of flashing past.
-    loop {
-        tokio::select! {
-            res = &mut batch, if batch_result.is_none() => {
-                batch_result = Some(match res {
-                    Ok(inner) => inner,
-                    Err(e) => Err(ProbeError::Stream(format!("batch task failed: {e}"))),
-                });
-            }
-            Some(ev) = run_rx.recv() => state.apply(ev),
-            Some(ev) = key_rx.recv() => {
-                if let Event::Key(k) = ev
-                    && k.kind == KeyEventKind::Press
-                {
-                    // Ctrl-C reaches us as a key in raw mode (not a signal); quit on it.
-                    let ctrl_c =
-                        k.code == KeyCode::Char('c') && k.modifiers.contains(KeyModifiers::CONTROL);
-                    if ctrl_c || handle_key(&mut state, k.code, &pause_tx) {
-                        break;
-                    }
-                }
-            }
-            _ = ticker.tick() => {
-                state.on_tick();
-                terminal.draw(|f| draw(f, &state, cfg)).map_err(io_err)?;
-            }
-        }
-    }
-
-    // Prefer the runner's authoritative result; fall back to what we collected
-    // if the user quit before the batch finished (the task is then abandoned).
-    match batch_result {
-        Some(Ok(result)) => Ok(result),
-        Some(Err(e)) => Err(e),
-        None => {
-            batch.abort();
-            Ok(BatchResult {
-                outcomes: Vec::from(std::mem::take(&mut state.outcomes)),
-                wall_clock: state.elapsed(),
-            })
-        }
-    }
+struct PartialConv {
+    conv_id: usize,
+    slot: usize,
+    turns: Vec<TurnOutcome>,
 }
 
-/// Returns `true` when the key requests quit. Overlays capture keys first.
-/// `pause_tx` gates request dispatch in the runner.
-fn handle_key(state: &mut TuiState, code: KeyCode, pause_tx: &watch::Sender<bool>) -> bool {
-    // Help overlay: any of ? / Esc / q closes it.
-    if state.show_help {
-        if matches!(code, KeyCode::Char('?') | KeyCode::Esc | KeyCode::Char('q')) {
-            state.show_help = false;
-        }
-        return false;
-    }
-    // Detail overlay: scroll within it; Enter/Esc close it.
-    if state.show_detail {
-        match code {
-            KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => state.show_detail = false,
-            KeyCode::Up | KeyCode::Char('k') => {
-                state.detail_scroll = state.detail_scroll.saturating_sub(1);
-            }
-            KeyCode::Down | KeyCode::Char('j') => {
-                state.detail_scroll = state.detail_scroll.saturating_add(1);
-            }
-            KeyCode::Char('g') => state.detail_scroll = 0,
-            _ => {}
-        }
-        return false;
-    }
-
-    let last = state.started.saturating_sub(1);
-    match code {
-        KeyCode::Char('q') | KeyCode::Esc => return true,
-        // Pause/resume sending new requests and freeze the live view.
-        KeyCode::Char('p') | KeyCode::Char(' ') => {
-            state.toggle_pause();
-            let _ = pause_tx.send(state.paused);
-        }
-        KeyCode::Char('?') => state.show_help = true,
-        // Open the inspector for the selected request.
-        KeyCode::Enter => {
-            if state.started > 0 {
-                state.show_detail = true;
-                state.detail_scroll = 0;
-            }
-        }
-        KeyCode::Up | KeyCode::Char('k') => state.selected = state.selected.saturating_sub(1),
-        KeyCode::Down | KeyCode::Char('j') => state.selected = (state.selected + 1).min(last),
-        KeyCode::Char('g') => state.selected = 0,
-        KeyCode::Char('G') => state.selected = last,
-        _ => {}
-    }
-    false
+struct ConvRow {
+    conv_id: usize,
+    slot: usize,
+    turn_count: usize,
+    active: bool,
+    avg_ttft_ms: Option<f64>,
+    avg_tps: Option<f64>,
+    total_prompt_tokens: u64,
+    total_completion_tokens: u64,
+    terminal: Option<TerminalReason>,
+    turns: Vec<TurnOutcome>,
 }
 
-/// One displayed request row.
-#[derive(Clone)]
-struct RowEntry {
-    id: usize,
-    /// `None` = in flight; `Some(outcome)` = finished.
-    outcome: Option<RequestOutcome>,
-    ttft: Option<Duration>,
-}
-
-/// In-memory dashboard state, mutated by events and read by the renderer.
 struct TuiState {
     start: Instant,
-    total: usize,
-    started: usize,
-    finished: usize,
-    ok: usize,
-    failed: usize,
-    in_flight: usize,
-    done: bool,
-    /// Paused: dispatch is gated and the live view is frozen.
-    paused: bool,
-    /// Total time spent paused, excluded from rate denominators.
-    paused_total: Duration,
-    /// Start of the current pause, if any.
-    pause_start: Option<Instant>,
-    show_help: bool,
-    /// Inspector overlay for the selected request.
-    show_detail: bool,
-    /// Selected row index into the newest-first request list.
-    selected: usize,
-    /// Vertical scroll within the open detail overlay.
-    detail_scroll: u16,
-    /// Rolling window of recent outcomes for live stats.
-    outcomes: VecDeque<RequestOutcome>,
-    /// Recent request rows by id (newest kept; oldest evicted past `KEEP_ROWS`).
-    rows: BTreeMap<usize, RowEntry>,
-    report: Option<Report>,
+    cfg_snap: ConfigSnapshot,
+    total_conversations: usize,
+    partial_convs: BTreeMap<usize, PartialConv>,
+    completed_convs: Vec<ConversationOutcome>,
+    report: Option<RunReport>,
     tps_hist: VecDeque<u64>,
     ttft_hist: VecDeque<u64>,
-    /// Set once the batch completes; freezes rate metrics (see `elapsed`).
+    selected: usize,
+    show_detail: bool,
+    detail_scroll: u16,
+    show_help: bool,
+    paused: bool,
+    /// Accumulated pause duration across all pause/resume cycles.
+    paused_total: Duration,
+    /// Wall-clock timestamp of the current pause start, if paused.
+    pause_start: Option<Instant>,
+    done: bool,
+    /// Frozen elapsed time captured the moment the run completes.
     final_elapsed: Option<Duration>,
+    is_replay: bool,
 }
 
 impl TuiState {
-    /// `total == 0` means the run is unbounded (runs until the user quits).
-    fn new(total: usize) -> Self {
+    fn new(cfg: &RunConfig) -> Self {
         Self {
             start: Instant::now(),
-            total,
-            started: 0,
-            finished: 0,
-            ok: 0,
-            failed: 0,
-            in_flight: 0,
-            done: false,
-            paused: false,
-            paused_total: Duration::ZERO,
-            pause_start: None,
-            show_help: false,
-            show_detail: false,
-            selected: 0,
-            detail_scroll: 0,
-            outcomes: VecDeque::new(),
-            rows: BTreeMap::new(),
+            cfg_snap: ConfigSnapshot {
+                endpoint: cfg.endpoint.clone(),
+                model: cfg.model.clone(),
+                concurrency: cfg.concurrency,
+                stream: cfg.stream,
+                max_tokens: cfg.max_tokens,
+                turn_prompt: cfg.turn_prompt.clone(),
+            },
+            total_conversations: cfg.conversations,
+            partial_convs: BTreeMap::new(),
+            completed_convs: Vec::new(),
             report: None,
             tps_hist: VecDeque::with_capacity(SPARK_LEN),
             ttft_hist: VecDeque::with_capacity(SPARK_LEN),
+            selected: 0,
+            show_detail: false,
+            detail_scroll: 0,
+            show_help: false,
+            paused: false,
+            paused_total: Duration::ZERO,
+            pause_start: None,
+            done: false,
             final_elapsed: None,
+            is_replay: false,
         }
     }
 
-    /// True when running indefinitely (`-n 0`).
+    fn from_result(result: &GrowResult) -> Self {
+        let mut s = Self {
+            start: Instant::now(),
+            cfg_snap: result.config.clone(),
+            total_conversations: result.conversations.len(),
+            partial_convs: BTreeMap::new(),
+            completed_convs: result.conversations.clone(),
+            report: None,
+            tps_hist: VecDeque::with_capacity(SPARK_LEN),
+            ttft_hist: VecDeque::with_capacity(SPARK_LEN),
+            selected: 0,
+            show_detail: false,
+            detail_scroll: 0,
+            show_help: false,
+            paused: false,
+            paused_total: Duration::ZERO,
+            pause_start: None,
+            done: true,
+            final_elapsed: Some(result.wall_clock),
+            is_replay: true,
+        };
+        s.recompute_report();
+        s
+    }
+
     fn infinite(&self) -> bool {
-        self.total == 0
+        self.total_conversations == 0
     }
 
-    /// Existing rows, newest id first — the order shown in the table and the
-    /// order `selected` indexes into.
-    fn sorted_rows(&self) -> Vec<&RowEntry> {
-        self.rows.values().rev().collect()
-    }
-
-    /// Wall-clock used for rate metrics. Frozen at completion, and excludes time
-    /// spent paused — so aggregate TPS / req/s / the timer hold steady while
-    /// paused and resume cleanly afterwards.
+    /// Wall-clock used for rate metrics.
+    /// Excludes time spent paused; frozen once the run completes.
     fn elapsed(&self) -> Duration {
         if let Some(done) = self.final_elapsed {
             return done;
         }
-        let paused = self.paused_total + self.pause_start.map(|t| t.elapsed()).unwrap_or_default();
+        let paused = self.paused_total
+            + self.pause_start.map(|t| t.elapsed()).unwrap_or_default();
         self.start.elapsed().saturating_sub(paused)
     }
 
-    /// Toggle pause: stop/resume the elapsed clock used for rates.
     fn toggle_pause(&mut self) {
         if self.paused {
             if let Some(started) = self.pause_start.take() {
@@ -306,49 +185,25 @@ impl TuiState {
 
     fn apply(&mut self, ev: RunEvent) {
         match ev {
-            RunEvent::Started { id } => {
-                self.started += 1;
-                self.in_flight += 1;
-                self.rows.insert(
-                    id,
-                    RowEntry {
-                        id,
-                        outcome: None,
-                        ttft: None,
-                    },
+            RunEvent::ConvStarted { conv_id, slot } => {
+                self.partial_convs.insert(
+                    conv_id,
+                    PartialConv { conv_id, slot, turns: Vec::new() },
                 );
-                self.prune_rows();
             }
-            RunEvent::FirstToken { id, ttft } => {
-                if let Some(row) = self.rows.get_mut(&id) {
-                    row.ttft = Some(ttft);
+            RunEvent::TurnStarted { .. } | RunEvent::TurnFirstToken { .. } => {}
+            RunEvent::TurnFinished { conv_id, outcome, .. } => {
+                if let Some(p) = self.partial_convs.get_mut(&conv_id) {
+                    p.turns.push(outcome);
                 }
             }
-            RunEvent::Finished { id, outcome } => {
-                self.finished += 1;
-                self.in_flight = self.in_flight.saturating_sub(1);
-                if outcome.success {
-                    self.ok += 1;
-                } else {
-                    self.failed += 1;
-                }
-                self.rows.insert(
-                    id,
-                    RowEntry {
-                        id,
-                        ttft: outcome.ttft,
-                        outcome: Some(outcome.clone()),
-                    },
-                );
-                self.prune_rows();
-
-                self.outcomes.push_back(outcome);
-                if self.outcomes.len() > KEEP_OUTCOMES {
-                    self.outcomes.pop_front();
-                }
-
-                // Only finite runs complete; an infinite run keeps going.
-                if !self.infinite() && self.finished >= self.total && !self.done {
+            RunEvent::ConvFinished { conv_id, outcome } => {
+                self.partial_convs.remove(&conv_id);
+                self.completed_convs.push(outcome);
+                if !self.infinite()
+                    && self.completed_convs.len() >= self.total_conversations
+                    && !self.done
+                {
                     self.done = true;
                     self.final_elapsed = Some(self.elapsed());
                 }
@@ -356,41 +211,114 @@ impl TuiState {
         }
     }
 
-    /// Drop the oldest rows once the window is full (no-op for typical finite runs).
-    fn prune_rows(&mut self) {
-        while self.rows.len() > KEEP_ROWS {
-            if let Some((&oldest, _)) = self.rows.iter().next() {
-                self.rows.remove(&oldest);
-            } else {
-                break;
+    fn recompute_report(&mut self) {
+        let snap = self.snapshot_result();
+        self.report = Some(aggregate(&snap));
+    }
+
+    /// Partial `GrowResult` for live metric computation.
+    /// Uses `self.elapsed()` as wall_clock so aggregate TPS is pause-aware.
+    fn snapshot_result(&self) -> GrowResult {
+        let mut conversations = self.completed_convs.clone();
+        for p in self.partial_convs.values() {
+            if !p.turns.is_empty() {
+                conversations.push(ConversationOutcome {
+                    id: p.conv_id,
+                    slot: p.slot,
+                    turns: p.turns.clone(),
+                    terminal: TerminalReason::Cancelled,
+                    wall_clock: Duration::ZERO,
+                });
+            }
+        }
+        GrowResult {
+            conversations,
+            wall_clock: self.elapsed(),
+            config: self.cfg_snap.clone(),
+        }
+    }
+
+    /// Called every tick: recompute metrics and push sparkline samples.
+    /// No-op while paused so the display freezes cleanly.
+    fn on_tick(&mut self) {
+        if self.paused {
+            return;
+        }
+        self.recompute_report();
+        if !self.done {
+            if let Some(ref r) = self.report {
+                push_capped(
+                    &mut self.tps_hist,
+                    r.turns.aggregate_tps.unwrap_or(0.0).round() as u64,
+                );
+                let ttft_ms = r.turns.ttft.map(|t| t.avg.round() as u64).unwrap_or(0);
+                push_capped(&mut self.ttft_hist, ttft_ms);
             }
         }
     }
 
-    /// Recompute live stats and push sparkline samples (decoupled from event
-    /// ingestion → no flicker).
-    fn on_tick(&mut self) {
-        // While paused, hold the last snapshot so the whole view is readable.
-        if self.paused {
-            return;
+    fn conv_rows(&self) -> Vec<ConvRow> {
+        let mut rows: Vec<ConvRow> = Vec::new();
+
+        for conv in &self.completed_convs {
+            let ok: Vec<&TurnOutcome> = conv.turns.iter().filter(|t| t.success).collect();
+            rows.push(ConvRow {
+                conv_id: conv.id,
+                slot: conv.slot,
+                turn_count: conv.turns.len(),
+                active: false,
+                avg_ttft_ms: mean(
+                    &ok.iter()
+                        .filter_map(|t| t.ttft.map(|d| d.as_secs_f64() * 1000.0))
+                        .collect::<Vec<_>>(),
+                ),
+                avg_tps: mean(&ok.iter().filter_map(|t| t.tps).collect::<Vec<_>>()),
+                total_prompt_tokens: ok
+                    .iter()
+                    .filter_map(|t| t.prompt_tokens)
+                    .map(u64::from)
+                    .sum(),
+                total_completion_tokens: ok
+                    .iter()
+                    .filter_map(|t| t.completion_tokens)
+                    .map(u64::from)
+                    .sum(),
+                terminal: Some(conv.terminal.clone()),
+                turns: conv.turns.clone(),
+            });
         }
-        // Frozen elapsed once done, so the aggregate stops moving on the final frame.
-        let elapsed = self.elapsed();
-        let report = aggregate(self.outcomes.make_contiguous(), elapsed);
-        // Only extend the sparklines while the batch is live; a completed run
-        // keeps its history rather than scrolling a flat tail forever.
-        if !self.done {
-            push_capped(
-                &mut self.tps_hist,
-                report.aggregate_tps.unwrap_or(0.0).round() as u64,
-            );
-            let ttft_ms = report
-                .ttft
-                .map(|t| (t.avg * 1000.0).round() as u64)
-                .unwrap_or(0);
-            push_capped(&mut self.ttft_hist, ttft_ms);
+
+        for p in self.partial_convs.values() {
+            let ok: Vec<&TurnOutcome> = p.turns.iter().filter(|t| t.success).collect();
+            rows.push(ConvRow {
+                conv_id: p.conv_id,
+                slot: p.slot,
+                turn_count: p.turns.len(),
+                active: true,
+                avg_ttft_ms: mean(
+                    &ok.iter()
+                        .filter_map(|t| t.ttft.map(|d| d.as_secs_f64() * 1000.0))
+                        .collect::<Vec<_>>(),
+                ),
+                avg_tps: mean(&ok.iter().filter_map(|t| t.tps).collect::<Vec<_>>()),
+                total_prompt_tokens: ok
+                    .iter()
+                    .filter_map(|t| t.prompt_tokens)
+                    .map(u64::from)
+                    .sum(),
+                total_completion_tokens: ok
+                    .iter()
+                    .filter_map(|t| t.completion_tokens)
+                    .map(u64::from)
+                    .sum(),
+                terminal: None,
+                turns: p.turns.clone(),
+            });
         }
-        self.report = Some(report);
+
+        rows.sort_by(|a, b| b.conv_id.cmp(&a.conv_id));
+        rows.truncate(MAX_CONV_ROWS);
+        rows
     }
 }
 
@@ -401,30 +329,196 @@ fn push_capped(buf: &mut VecDeque<u64>, v: u64) {
     buf.push_back(v);
 }
 
-// ---- rendering ------------------------------------------------------------
+// ── Public entry points ───────────────────────────────────────────────────────
 
-fn draw(frame: &mut ratatui::Frame, state: &TuiState, cfg: &RunConfig) {
+/// Run the live grow-mode TUI and return the authoritative `GrowResult`.
+pub async fn run(cfg: &RunConfig) -> Result<GrowResult, ProbeError> {
+    let prev_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let _ = disable_raw_mode();
+        let _ = execute!(io::stdout(), LeaveAlternateScreen);
+        prev_hook(info);
+    }));
+
+    let _guard = TerminalGuard::enter()?;
+    let backend = CrosstermBackend::new(io::stdout());
+    let mut terminal = Terminal::new(backend).map_err(io_err)?;
+
+    let (run_tx, mut run_rx) = unbounded_channel::<RunEvent>();
+    let (pause_tx, pause_rx) = watch::channel(false);
+    let cfg_task = cfg.clone();
+    let mut grow_task =
+        tokio::spawn(async move { run_grow(&cfg_task, Some(run_tx), Some(pause_rx)).await });
+
+    let (key_tx, mut key_rx) = unbounded_channel::<Event>();
+    std::thread::spawn(move || {
+        while let Ok(ev) = event::read() {
+            if key_tx.send(ev).is_err() {
+                break;
+            }
+        }
+    });
+
+    let mut state = TuiState::new(cfg);
+    let mut ticker = tokio::time::interval(TICK);
+    let mut grow_result: Option<Result<GrowResult, ProbeError>> = None;
+
+    loop {
+        tokio::select! {
+            res = &mut grow_task, if grow_result.is_none() => {
+                grow_result = Some(match res {
+                    Ok(inner) => inner,
+                    Err(e) => Err(ProbeError::Stream(format!("runner task failed: {e}"))),
+                });
+            }
+            Some(ev) = run_rx.recv() => state.apply(ev),
+            Some(ev) = key_rx.recv() => {
+                if let Event::Key(k) = ev
+                    && k.kind == KeyEventKind::Press
+                {
+                    let ctrl_c = k.code == KeyCode::Char('c')
+                        && k.modifiers.contains(KeyModifiers::CONTROL);
+                    if ctrl_c || handle_key(&mut state, k.code, &pause_tx) {
+                        break;
+                    }
+                }
+            }
+            _ = ticker.tick() => {
+                state.on_tick();
+                terminal.draw(|f| draw(f, &state)).map_err(io_err)?;
+            }
+        }
+    }
+
+    match grow_result {
+        Some(Ok(result)) => Ok(result),
+        Some(Err(e)) => Err(e),
+        None => {
+            grow_task.abort();
+            Ok(state.snapshot_result())
+        }
+    }
+}
+
+/// Open an interactive replay of a saved `GrowResult` (no HTTP requests made).
+pub async fn replay(result: &GrowResult) -> Result<(), ProbeError> {
+    let prev_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let _ = disable_raw_mode();
+        let _ = execute!(io::stdout(), LeaveAlternateScreen);
+        prev_hook(info);
+    }));
+
+    let _guard = TerminalGuard::enter()?;
+    let backend = CrosstermBackend::new(io::stdout());
+    let mut terminal = Terminal::new(backend).map_err(io_err)?;
+
+    let (key_tx, mut key_rx) = unbounded_channel::<Event>();
+    std::thread::spawn(move || {
+        while let Ok(ev) = event::read() {
+            if key_tx.send(ev).is_err() {
+                break;
+            }
+        }
+    });
+
+    let mut state = TuiState::from_result(result);
+    let mut ticker = tokio::time::interval(TICK);
+    // Replay has no pause — use a dummy sender that is immediately dropped.
+    let (no_pause, _) = watch::channel(false);
+
+    loop {
+        tokio::select! {
+            Some(ev) = key_rx.recv() => {
+                if let Event::Key(k) = ev
+                    && k.kind == KeyEventKind::Press
+                {
+                    if handle_key(&mut state, k.code, &no_pause) {
+                        break;
+                    }
+                }
+            }
+            _ = ticker.tick() => {
+                terminal.draw(|f| draw(f, &state)).map_err(io_err)?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+// ── Key handling ──────────────────────────────────────────────────────────────
+
+/// Returns `true` when the key means "quit".
+fn handle_key(state: &mut TuiState, code: KeyCode, pause_tx: &watch::Sender<bool>) -> bool {
+    if state.show_help {
+        if matches!(code, KeyCode::Char('?') | KeyCode::Esc | KeyCode::Char('q')) {
+            state.show_help = false;
+        }
+        return false;
+    }
+    if state.show_detail {
+        match code {
+            KeyCode::Esc | KeyCode::Char('q') => state.show_detail = false,
+            KeyCode::Up | KeyCode::Char('k') => {
+                state.detail_scroll = state.detail_scroll.saturating_sub(1);
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                state.detail_scroll = state.detail_scroll.saturating_add(1);
+            }
+            KeyCode::Char('g') => state.detail_scroll = 0,
+            _ => {}
+        }
+        return false;
+    }
+
+    let row_count = state.conv_rows().len();
+    let last = row_count.saturating_sub(1);
+
+    match code {
+        KeyCode::Char('q') | KeyCode::Esc => return true,
+        KeyCode::Char('p') | KeyCode::Char(' ') if !state.is_replay => {
+            state.toggle_pause();
+            let _ = pause_tx.send(state.paused);
+        }
+        KeyCode::Char('?') => state.show_help = true,
+        KeyCode::Enter if row_count > 0 => {
+            state.show_detail = true;
+            state.detail_scroll = 0;
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            state.selected = state.selected.saturating_sub(1);
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            state.selected = (state.selected + 1).min(last);
+        }
+        KeyCode::Char('g') => state.selected = 0,
+        KeyCode::Char('G') => state.selected = last,
+        _ => {}
+    }
+    false
+}
+
+// ── Rendering ─────────────────────────────────────────────────────────────────
+
+fn draw(frame: &mut ratatui::Frame, state: &TuiState) {
     let areas = Layout::vertical([
         Constraint::Length(3), // header
-        Constraint::Length(4), // progress
-        Constraint::Length(6), // metric tiles
-        Constraint::Length(6), // sparklines
-        Constraint::Length(9), // distribution
-        Constraint::Min(4),    // request table
+        Constraint::Length(4), // metric tiles
+        Constraint::Length(4), // sparklines
+        Constraint::Min(5),    // conversation table
         Constraint::Length(1), // footer
     ])
     .split(frame.area());
 
-    draw_header(frame, areas[0], state, cfg);
-    draw_progress(frame, areas[1], state);
-    draw_tiles(frame, areas[2], state);
-    draw_sparklines(frame, areas[3], state);
-    draw_distribution(frame, areas[4], state);
-    draw_requests(frame, areas[5], state);
-    draw_footer(frame, areas[6], state);
+    draw_header(frame, areas[0], state);
+    draw_tiles(frame, areas[1], state);
+    draw_sparklines(frame, areas[2], state);
+    draw_conversations(frame, areas[3], state);
+    draw_footer(frame, areas[4], state);
 
     if state.show_detail {
-        draw_detail(frame, state, cfg);
+        draw_detail(frame, state);
     }
     if state.show_help {
         draw_help(frame);
@@ -441,117 +535,122 @@ fn panel(title: &str) -> Block<'_> {
         ))
 }
 
-fn draw_header(frame: &mut ratatui::Frame, area: Rect, state: &TuiState, cfg: &RunConfig) {
-    let mode = if cfg.stream { "streaming" } else { "blocking" };
+fn draw_header(frame: &mut ratatui::Frame, area: Rect, state: &TuiState) {
     let elapsed = state.elapsed().as_secs_f64();
+    let (mode_str, mode_fg, mode_bg) = if state.is_replay {
+        (" REPLAY ", ACCENT, Color::Reset)
+    } else if state.paused {
+        (" PAUSED ", Color::Black, Color::Yellow)
+    } else if state.done {
+        ("  DONE  ", Color::Black, Color::Green)
+    } else {
+        ("  LIVE  ", Color::Black, Color::Green)
+    };
+
     let line = Line::from(vec![
         Span::raw(format!(
-            "{} · {} · {mode} · c={}",
-            cfg.endpoint, cfg.model, cfg.concurrency
+            "  {} · {} · c={} · stream={}",
+            state.cfg_snap.endpoint,
+            state.cfg_snap.model,
+            state.cfg_snap.concurrency,
+            state.cfg_snap.stream,
         )),
         Span::raw("    "),
-        Span::styled(format!("⏱ {elapsed:5.1}s"), Style::default().fg(ACCENT)),
+        Span::styled(
+            format!("⏱ {elapsed:.1}s"),
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("    "),
+        Span::styled(
+            mode_str,
+            Style::default()
+                .fg(mode_fg)
+                .bg(mode_bg)
+                .add_modifier(Modifier::BOLD),
+        ),
     ]);
     frame.render_widget(Paragraph::new(line).block(panel("llmprobe")), area);
 }
 
-fn draw_progress(frame: &mut ratatui::Frame, area: Rect, state: &TuiState) {
-    let rows = Layout::vertical([Constraint::Length(1), Constraint::Length(1)])
-        .margin(1)
-        .split(area);
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded);
-    frame.render_widget(block, area);
-
-    if state.infinite() {
-        // No known total: show a steady full bar with running counters.
-        let gauge = Gauge::default()
-            .gauge_style(Style::default().fg(ACCENT))
-            .ratio(1.0)
-            .label(format!(
-                "∞ running   {} done · {} live · ✓ {} · ✗ {}",
-                state.finished, state.in_flight, state.ok, state.failed
-            ));
-        frame.render_widget(gauge, rows[0]);
-    } else {
-        let ratio = if state.total == 0 {
-            0.0
-        } else {
-            state.finished as f64 / state.total as f64
-        };
-        let gauge = Gauge::default()
-            .gauge_style(Style::default().fg(gauge_color(ratio)))
-            .ratio(ratio)
-            .label(format!(
-                "{:.0}%   {}/{} · {} live · ✓ {} · ✗ {}",
-                ratio * 100.0,
-                state.finished,
-                state.total,
-                state.in_flight,
-                state.ok,
-                state.failed
-            ));
-        frame.render_widget(gauge, rows[0]);
-    }
-
-    let success = if state.finished == 0 {
-        100.0
-    } else {
-        state.ok as f64 / state.finished as f64 * 100.0
-    };
-    let elapsed = state.elapsed().as_secs_f64();
-    let rps = if elapsed > 0.0 {
-        state.ok as f64 / elapsed
-    } else {
-        0.0
-    };
-    frame.render_widget(
-        Paragraph::new(format!("success {success:.1}%    req/s {rps:.1}")),
-        rows[1],
-    );
-}
-
 fn draw_tiles(frame: &mut ratatui::Frame, area: Rect, state: &TuiState) {
     let cols = Layout::horizontal([
-        Constraint::Ratio(1, 3),
-        Constraint::Ratio(1, 3),
-        Constraint::Ratio(1, 3),
+        Constraint::Ratio(1, 4),
+        Constraint::Ratio(1, 4),
+        Constraint::Ratio(1, 4),
+        Constraint::Ratio(1, 4),
     ])
     .split(area);
+
     let r = state.report.as_ref();
 
-    let throughput = vec![
-        tile_line(opt(r.and_then(|r| r.aggregate_tps), "tok/s"), "aggregate"),
-        tile_line(opt(r.and_then(|r| r.avg_tps), "tok/s"), "per req"),
-        tile_line(opt(r.and_then(|r| r.mean_itl_ms), "ms"), "inter-token"),
-    ];
+    // TTFT tile
+    let ttft = r.and_then(|r| r.turns.ttft);
     frame.render_widget(
-        Paragraph::new(throughput).block(panel("throughput")),
+        Paragraph::new(vec![
+            tile_line(ms_val(ttft.map(|t| t.p50)), "p50"),
+            tile_line(ms_val(ttft.map(|t| t.p95)), "p95"),
+            tile_line(ms_val(ttft.map(|t| t.p99)), "p99"),
+        ])
+        .block(panel("TTFT")),
         cols[0],
     );
 
-    let e2e = r.and_then(|r| r.e2e);
-    let lat = vec![
-        tile_line(opt_secs(e2e.map(|e| e.p50)), "p50"),
-        tile_line(opt_secs(e2e.map(|e| e.avg)), "avg"),
-        tile_line(opt_secs(e2e.map(|e| e.p95)), "p95"),
-    ];
-    frame.render_widget(Paragraph::new(lat).block(panel("latency · e2e")), cols[1]);
+    // TPS tile
+    let tps = r.and_then(|r| r.turns.tps);
+    let agg_tps = r.and_then(|r| r.turns.aggregate_tps);
+    frame.render_widget(
+        Paragraph::new(vec![
+            tile_line(tps_val(tps.map(|t| t.p50)), "p50 per-req"),
+            tile_line(tps_val(tps.map(|t| t.p95)), "p95 per-req"),
+            tile_line(tps_val(agg_tps), "aggregate"),
+        ])
+        .block(panel("TPS tok/s")),
+        cols[1],
+    );
 
-    let ttft = r.and_then(|r| r.ttft);
-    let ft = vec![
-        tile_line(opt_secs(ttft.map(|t| t.avg)), "avg"),
-        tile_line(opt_secs(ttft.map(|t| t.p95)), "p95"),
-        tile_line(opt_secs(ttft.map(|t| t.min)), "min"),
-    ];
-    frame.render_widget(Paragraph::new(ft).block(panel("first token")), cols[2]);
+    // Status tile
+    let ok_turns = r.map(|r| r.turns.ok_turns).unwrap_or(0);
+    let total_turns = r.map(|r| r.turns.total_turns).unwrap_or(0);
+    let success_pct = if total_turns > 0 {
+        ok_turns as f64 / total_turns as f64 * 100.0
+    } else {
+        100.0
+    };
+    let active = state.partial_convs.len();
+    let concurrency = state.cfg_snap.concurrency;
+    let completed = state.completed_convs.len();
+    frame.render_widget(
+        Paragraph::new(vec![
+            tile_line(format!("{success_pct:.1}%"), "success rate"),
+            tile_line(format!("{active}/{concurrency}"), "active slots"),
+            tile_line(completed.to_string(), "convs done"),
+        ])
+        .block(panel("Status")),
+        cols[2],
+    );
+
+    // Throughput tile
+    let total_tok = r.map(|r| r.turns.total_completion_tokens).unwrap_or(0);
+    let target = if state.infinite() {
+        "∞".to_string()
+    } else {
+        state.total_conversations.to_string()
+    };
+    frame.render_widget(
+        Paragraph::new(vec![
+            tile_line(fmt_thousands(total_tok), "compl tokens"),
+            tile_line(format!("{ok_turns}/{total_turns}"), "turns ok/total"),
+            tile_line(target, "target convs"),
+        ])
+        .block(panel("Throughput")),
+        cols[3],
+    );
 }
 
 fn tile_line(value: String, label: &str) -> Line<'static> {
     Line::from(vec![
         Span::styled(
-            format!("{value:>9}  "),
+            format!("  {value:>10}  "),
             Style::default().add_modifier(Modifier::BOLD),
         ),
         Span::styled(label.to_string(), Style::default().fg(Color::DarkGray)),
@@ -565,71 +664,102 @@ fn draw_sparklines(frame: &mut ratatui::Frame, area: Rect, state: &TuiState) {
     let ttft: Vec<u64> = state.ttft_hist.iter().copied().collect();
     frame.render_widget(
         Sparkline::default()
-            .block(panel("TPS"))
+            .block(panel("Agg TPS history"))
             .data(&tps)
             .style(Style::default().fg(ACCENT)),
         cols[0],
     );
     frame.render_widget(
         Sparkline::default()
-            .block(panel("TTFT · ms"))
+            .block(panel("TTFT avg ms"))
             .data(&ttft)
             .style(Style::default().fg(Color::Magenta)),
         cols[1],
     );
 }
 
-fn draw_distribution(frame: &mut ratatui::Frame, area: Rect, state: &TuiState) {
-    let samples: Vec<f64> = state
-        .outcomes
-        .iter()
-        .filter(|o| o.success)
-        .map(|o| o.e2e.as_secs_f64())
-        .collect();
-    let buckets = histogram(&samples, 6);
-    let labels: Vec<String> = buckets.iter().map(|(lab, _)| lab.clone()).collect();
-    let data: Vec<(&str, u64)> = buckets
-        .iter()
-        .enumerate()
-        .map(|(i, (_, count))| (labels[i].as_str(), *count))
-        .collect();
-    let chart = BarChart::default()
-        .block(panel("e2e distribution"))
-        .data(data.as_slice())
-        .bar_width(8)
-        .bar_gap(1)
-        .bar_style(Style::default().fg(ACCENT))
-        .value_style(Style::default().add_modifier(Modifier::BOLD));
-    frame.render_widget(chart, area);
-}
+fn draw_conversations(frame: &mut ratatui::Frame, area: Rect, state: &TuiState) {
+    let rows = state.conv_rows();
+    let selected = state.selected.min(rows.len().saturating_sub(1));
 
-fn draw_requests(frame: &mut ratatui::Frame, area: Rect, state: &TuiState) {
-    let header = Row::new(["#", "status", "e2e", "ttft", "tok/s", "tokens", "itl"])
-        .style(Style::default().fg(Color::DarkGray));
+    let header = Row::new([
+        "#", "slot", "turns", "state", "TTFT avg", "TPS avg",
+        "prompt-tok", "compl-tok", "terminal",
+    ])
+    .style(Style::default().fg(Color::DarkGray))
+    .height(1);
 
-    let rows = state.sorted_rows();
-    let table_rows: Vec<Row> = rows.iter().take(MAX_ROWS).map(row_cells).collect();
-    // Selection drives an auto-scrolling TableState: the cursor stays visible
-    // however far down the list it moves. Frozen only affects the title.
-    let selected = state.selected.min(table_rows.len().saturating_sub(1));
+    let table_rows: Vec<Row> = rows
+        .iter()
+        .map(|r| {
+            let dash = "—";
+            let state_cell = if r.active {
+                Cell::from(Span::styled("● active", Style::default().fg(Color::Cyan)))
+            } else {
+                Cell::from(Span::styled("✓ done", Style::default().fg(Color::Green)))
+            };
+            let terminal_cell = match &r.terminal {
+                Some(TerminalReason::ContextLimit) => Cell::from(Span::styled(
+                    "ctx-limit",
+                    Style::default().fg(Color::Green),
+                )),
+                Some(TerminalReason::MaxTurns) => Cell::from(Span::styled(
+                    "max-turns",
+                    Style::default().fg(Color::Yellow),
+                )),
+                Some(t) => Cell::from(Span::styled(
+                    t.to_string(),
+                    Style::default().fg(Color::Red),
+                )),
+                None => Cell::from(dash),
+            };
+            let pt = if r.total_prompt_tokens > 0 {
+                fmt_thousands(r.total_prompt_tokens)
+            } else {
+                dash.to_string()
+            };
+            let ct = if r.total_completion_tokens > 0 {
+                fmt_thousands(r.total_completion_tokens)
+            } else {
+                dash.to_string()
+            };
+            Row::new(vec![
+                Cell::from(r.conv_id.to_string()),
+                Cell::from(format!("[{}]", r.slot)),
+                Cell::from(r.turn_count.to_string()),
+                state_cell,
+                Cell::from(r.avg_ttft_ms.map_or(dash.to_string(), |v| format!("{v:.0}ms"))),
+                Cell::from(r.avg_tps.map_or(dash.to_string(), |v| format!("{v:.1}"))),
+                Cell::from(pt),
+                Cell::from(ct),
+                terminal_cell,
+            ])
+        })
+        .collect();
+
     let mut ts = TableState::default();
     if !table_rows.is_empty() {
         ts.select(Some(selected));
     }
 
-    let title = if state.paused {
-        "requests (paused) — ↑/↓ select · enter inspect"
+    let title = if state.is_replay {
+        "conversations [REPLAY] — ↑/↓ select  ·  enter: turn detail  ·  q quit"
+    } else if state.paused {
+        "conversations [PAUSED] — ↑/↓ select  ·  enter: turn detail  ·  space: resume"
     } else {
-        "requests — ↑/↓ select · enter inspect · space pause"
+        "conversations — ↑/↓ select  ·  enter: turn detail  ·  space: pause"
     };
+
     let widths = [
         Constraint::Length(5),
+        Constraint::Length(5),
+        Constraint::Length(6),
+        Constraint::Length(9),
         Constraint::Length(9),
         Constraint::Length(8),
-        Constraint::Length(8),
-        Constraint::Length(8),
-        Constraint::Length(8),
-        Constraint::Length(9),
+        Constraint::Length(11),
+        Constraint::Length(10),
+        Constraint::Min(9),
     ];
     let table = Table::new(table_rows, widths)
         .header(header)
@@ -643,44 +773,115 @@ fn draw_requests(frame: &mut ratatui::Frame, area: Rect, state: &TuiState) {
     frame.render_stateful_widget(table, area, &mut ts);
 }
 
-fn row_cells(row: &&RowEntry) -> Row<'static> {
-    let dash = "—".to_string();
-    match &row.outcome {
-        None => Row::new(vec![
-            Cell::from(row.id.to_string()),
-            Cell::from(Span::styled("● live", Style::default().fg(Color::DarkGray))),
-            Cell::from(dash.clone()),
-            Cell::from(opt_secs(row.ttft.map(|t| t.as_secs_f64()))),
-            Cell::from(dash.clone()),
-            Cell::from(dash.clone()),
-            Cell::from(dash),
-        ]),
-        Some(o) if o.success => Row::new(vec![
-            Cell::from(o.id.to_string()),
-            Cell::from(Span::styled("✓ ok", Style::default().fg(Color::Green))),
-            Cell::from(format!("{:.2}s", o.e2e.as_secs_f64())),
-            Cell::from(opt_secs(o.ttft.map(|t| t.as_secs_f64()))),
-            Cell::from(o.tps.map_or(dash.clone(), |v| format!("{v:.1}"))),
-            Cell::from(o.completion_tokens.map_or(dash.clone(), |v| v.to_string())),
-            Cell::from(o.itl_ms.map_or(dash, |v| format!("{v:.1}ms"))),
-        ]),
-        Some(o) => {
-            let label = o.error.map_or("✗ err".to_string(), |e| format!("✗ {e}"));
-            Row::new(vec![
-                Cell::from(o.id.to_string()),
-                Cell::from(Span::styled(label, Style::default().fg(Color::Red))),
-                Cell::from(format!("{:.2}s", o.e2e.as_secs_f64())),
-                Cell::from(dash.clone()),
-                Cell::from(dash.clone()),
-                Cell::from(dash.clone()),
-                Cell::from(dash),
-            ])
+fn draw_detail(frame: &mut ratatui::Frame, state: &TuiState) {
+    let rows = state.conv_rows();
+    let selected = state.selected.min(rows.len().saturating_sub(1));
+    let Some(row) = rows.get(selected) else {
+        return;
+    };
+
+    let area = centered_fixed(frame.area(), 102, 34);
+    frame.render_widget(Clear, area);
+
+    let head = Style::default().fg(ACCENT).add_modifier(Modifier::BOLD);
+    let dim = Style::default().fg(Color::DarkGray);
+    let mut lines: Vec<Line> = Vec::new();
+
+    // Conversation summary
+    let state_str = if row.active { "● active" } else { "✓ done" };
+    lines.push(Line::from(Span::styled(
+        format!(
+            "  Conv #{} · slot [{}] · {} turns · {}",
+            row.conv_id, row.slot, row.turn_count, state_str
+        ),
+        head,
+    )));
+    if let Some(ref t) = row.terminal {
+        let color = match t {
+            TerminalReason::ContextLimit => Color::Green,
+            TerminalReason::MaxTurns => Color::Yellow,
+            _ => Color::Red,
+        };
+        lines.push(Line::from(vec![
+            Span::styled("  terminal: ", dim),
+            Span::styled(t.to_string(), Style::default().fg(color)),
+        ]));
+    }
+    {
+        let mut summary = String::from("  ");
+        if let Some(v) = row.avg_ttft_ms {
+            summary.push_str(&format!("avg TTFT {v:.0}ms"));
+        }
+        if let Some(v) = row.avg_tps {
+            summary.push_str(&format!("  ·  avg TPS {v:.1} tok/s"));
+        }
+        if !summary.trim().is_empty() {
+            lines.push(Line::from(Span::styled(summary, dim)));
         }
     }
+    lines.push(Line::from(""));
+
+    // Turn table header
+    lines.push(Line::from(Span::styled(
+        format!(
+            "  {:>4}  {:>10}  {:>10}  {:>7}  {:>7}  {:>8}  {:>7}  status",
+            "turn", "prompt-tok", "compl-tok", "e2e", "ttft", "tpot", "tps"
+        ),
+        dim,
+    )));
+    lines.push(Line::from(Span::styled(
+        format!("  {}", "─".repeat(72)),
+        dim,
+    )));
+
+    for t in &row.turns {
+        let dash = "—";
+        let status_span = if t.success {
+            Span::styled("✓ ok", Style::default().fg(Color::Green))
+        } else {
+            let label = t.error.map_or("✗ error".to_string(), |e| format!("✗ {e}"));
+            Span::styled(label, Style::default().fg(Color::Red))
+        };
+        lines.push(Line::from(vec![
+            Span::raw(format!(
+                "  {:>4}  {:>10}  {:>10}  {:>7}  {:>7}  {:>8}  {:>7}  ",
+                t.turn_idx + 1,
+                t.prompt_tokens
+                    .map_or(dash.to_string(), |v| fmt_thousands(u64::from(v))),
+                t.completion_tokens
+                    .map_or(dash.to_string(), |v| fmt_thousands(u64::from(v))),
+                format!("{:.2}s", t.e2e.as_secs_f64()),
+                t.ttft
+                    .map_or(dash.to_string(), |d| format!("{:.0}ms", d.as_secs_f64() * 1000.0)),
+                t.tpot_ms.map_or(dash.to_string(), |v| format!("{v:.1}ms")),
+                t.tps.map_or(dash.to_string(), |v| format!("{v:.1}")),
+            )),
+            status_span,
+        ]));
+    }
+    if row.turns.is_empty() {
+        lines.push(Line::from(Span::styled("  (no turns recorded yet)", dim)));
+    }
+
+    let title = format!(" conv #{} detail  ·  ↑/↓ scroll  ·  esc / q close ", row.conv_id);
+    let para = Paragraph::new(lines)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .title(Span::styled(
+                    title,
+                    Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                ))
+                .padding(Padding::new(0, 1, 0, 0)),
+        )
+        .wrap(Wrap { trim: false })
+        .scroll((state.detail_scroll, 0));
+    frame.render_widget(para, area);
 }
 
 fn draw_footer(frame: &mut ratatui::Frame, area: Rect, state: &TuiState) {
-    if state.paused {
+    if state.paused && !state.is_replay {
         let line = Line::from(vec![
             Span::styled(
                 " PAUSED ",
@@ -690,17 +891,19 @@ fn draw_footer(frame: &mut ratatui::Frame, area: Rect, state: &TuiState) {
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled(
-                "  space/p resume · ↑/↓ select · enter inspect · q quit",
+                "  space/p resume  ·  ↑/↓ select  ·  enter detail  ·  q quit  ·  ? help",
                 Style::default().fg(Color::DarkGray),
             ),
         ]);
         frame.render_widget(Paragraph::new(line), area);
         return;
     }
-    let text = if state.done {
-        "DONE — ↑/↓ select · enter inspect · q quit · ? help"
+    let text = if state.is_replay {
+        " [REPLAY]  q / esc quit  ·  ↑/↓ select  ·  enter detail  ·  ? help"
+    } else if state.done {
+        " [DONE]  q quit  ·  ↑/↓ select  ·  enter detail  ·  ? help"
     } else {
-        "q quit · space pause · ↑/↓ select · enter inspect · ? help"
+        " q quit  ·  space/p pause  ·  ↑/↓ select  ·  enter detail  ·  ? help"
     };
     frame.render_widget(
         Paragraph::new(text).style(Style::default().fg(Color::DarkGray)),
@@ -708,166 +911,60 @@ fn draw_footer(frame: &mut ratatui::Frame, area: Rect, state: &TuiState) {
     );
 }
 
-/// Full-exchange inspector for the selected request: the JSON payload sent and
-/// the model's reply (or the error body), scrollable for long responses.
-fn draw_detail(frame: &mut ratatui::Frame, state: &TuiState, cfg: &RunConfig) {
-    let rows = state.sorted_rows();
-    let Some(row) = rows.get(state.selected.min(rows.len().saturating_sub(1))) else {
-        return;
-    };
-
-    let area = centered_fixed(frame.area(), 92, 30);
-    frame.render_widget(Clear, area);
-
-    let dim = Style::default().fg(Color::DarkGray);
-    let head = Style::default().fg(ACCENT).add_modifier(Modifier::BOLD);
-    let mut lines: Vec<Line> = Vec::new();
-
-    // --- request (reconstructed; identical for every request) ---------------
-    lines.push(Line::from(Span::styled("REQUEST", head)));
-    lines.push(Line::from(vec![
-        Span::styled("POST ", dim),
-        Span::raw(cfg.endpoint.clone()),
-    ]));
-    lines.push(Line::from(Span::styled(
-        "Content-Type: application/json",
-        dim,
-    )));
-    if cfg.api_key.is_some() {
-        lines.push(Line::from(Span::styled(
-            "Authorization: Bearer ***redacted***",
-            dim,
-        )));
-    }
-    for (k, v) in &cfg.headers {
-        lines.push(Line::from(Span::styled(format!("{k}: {v}"), dim)));
-    }
-    lines.push(Line::from(""));
-    for l in request_json(cfg).lines() {
-        lines.push(Line::from(l.to_string()));
-    }
-    lines.push(Line::from(""));
-
-    // --- response / error ---------------------------------------------------
-    let (status_span, meta) = match &row.outcome {
-        None => (
-            Span::styled("● in flight", dim),
-            "waiting for response…".to_string(),
-        ),
-        Some(o) if o.success => (
-            Span::styled("✓ ok", Style::default().fg(Color::Green)),
-            format!(
-                "{} · {} tok · {} tok/s",
-                opt_secs(Some(o.e2e.as_secs_f64())),
-                o.completion_tokens.map_or("—".into(), |t| t.to_string()),
-                o.tps.map_or("—".into(), |v| format!("{v:.1}")),
-            ),
-        ),
-        Some(o) => (
-            Span::styled(
-                o.error.map_or("✗ error".to_string(), |e| format!("✗ {e}")),
-                Style::default().fg(Color::Red),
-            ),
-            opt_secs(Some(o.e2e.as_secs_f64())),
-        ),
-    };
-    lines.push(Line::from(vec![
-        Span::styled("RESPONSE  ", head),
-        status_span,
-        Span::styled(format!("   {meta}"), dim),
-    ]));
-    lines.push(Line::from(""));
-    match row.outcome.as_ref().and_then(|o| o.body.as_deref()) {
-        Some(body) => {
-            for l in body.lines() {
-                lines.push(Line::from(l.to_string()));
-            }
-        }
-        None if row.outcome.is_none() => {}
-        None => lines.push(Line::from(Span::styled("(no body)", dim))),
-    }
-
-    let title = format!("request #{}  ·  ↑/↓ scroll · esc close", row.id);
-    let para = Paragraph::new(lines)
-        .block(panel(&title).padding(Padding::new(1, 1, 0, 0)))
-        .wrap(Wrap { trim: false })
-        .scroll((state.detail_scroll, 0));
-    frame.render_widget(para, area);
-}
-
-/// Pretty-print the JSON body llmprobe sends (the same for every request).
-fn request_json(cfg: &RunConfig) -> String {
-    let msgs: Vec<serde_json::Value> = if cfg.messages.is_empty() {
-        vec![serde_json::json!({ "role": "user", "content": cfg.prompt })]
-    } else {
-        cfg.messages
-            .iter()
-            .map(|(role, content)| serde_json::json!({ "role": role, "content": content }))
-            .collect()
-    };
-    let mut body = serde_json::json!({
-        "model": cfg.model,
-        "messages": msgs,
-        "max_tokens": cfg.max_tokens,
-        "stream": cfg.stream,
-    });
-    if let Some(t) = cfg.temperature {
-        body["temperature"] = serde_json::json!(t);
-    }
-    if cfg.stream {
-        body["stream_options"] = serde_json::json!({ "include_usage": true });
-    }
-    serde_json::to_string_pretty(&body).unwrap_or_default()
-}
-
 fn draw_help(frame: &mut ratatui::Frame) {
-    let area = centered_fixed(frame.area(), 62, 22);
+    let area = centered_fixed(frame.area(), 72, 28);
     frame.render_widget(Clear, area);
 
-    // Aligned two-column rows: a styled left key/term, a plain description.
-    let key = |k: &str, d: &str| {
+    let key = |k: &'static str, d: &'static str| {
         Line::from(vec![
             Span::styled(
-                format!("{k:<11}"),
+                format!("{k:<18}"),
                 Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
             ),
-            Span::raw(d.to_string()),
+            Span::raw(d),
         ])
     };
-    let term = |t: &str, d: &str| {
+    let term = |t: &'static str, d: &'static str| {
         Line::from(vec![
             Span::styled(
-                format!("{t:<11}"),
+                format!("{t:<18}"),
                 Style::default().add_modifier(Modifier::BOLD),
             ),
-            Span::raw(d.to_string()),
+            Span::raw(d),
         ])
     };
-    let section = |s: &str| {
+    let section = |s: &'static str| {
         Line::from(Span::styled(
-            s.to_string(),
+            s,
             Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
         ))
     };
 
     let lines = vec![
         section("KEYS"),
-        key("↑ ↓ / j k", "select a request   ·   g top · G bottom"),
-        key("enter", "inspect the selected request (full exchange)"),
-        key("space / p", "pause sending + freeze the view (read steady)"),
-        key("?", "toggle this help"),
-        key("q / Esc", "quit — restore terminal, print report"),
+        key("↑/↓  j/k", "navigate conversations"),
+        key("g  G", "jump to top / bottom of list"),
+        key("enter", "open turn-detail for selected conversation"),
+        key("space / p", "pause / resume dispatch and freeze metrics"),
+        key("?", "toggle this help overlay"),
+        key("q / Esc", "quit and restore terminal (report printed after)"),
         Line::from(""),
         section("METRICS"),
-        term("e2e", "full round trip: send → last byte back"),
-        term("TTFT", "wait for the first token (streaming)"),
-        term("TPS", "tokens/s: per-req decode, or aggregate"),
-        term("ITL", "mean gap between tokens (ms); lower = smoother"),
-        term("p50 / p95", "half / 95% of requests faster than this"),
-        term("speedup", "aggregate ÷ per-req TPS (≈1 = no scaling)"),
+        term("TTFT", "time from request send to first content token (streaming)"),
+        term("TPOT", "(e2e − TTFT) / (tokens − 1) — per-step decode latency"),
+        term("TPS per-req", "completion_tokens / decode_window in tok/s"),
+        term("TPS aggregate", "Σ completion_tokens / wall_clock (pause-excluded)"),
+        term("p50 / p95 / p99", "percentiles across all successful turns"),
+        Line::from(""),
+        section("CONVERSATION STATES"),
+        term("● active", "a slot is currently running turns"),
+        term("✓ done", "conversation reached its terminal condition"),
+        term("ctx-limit", "server refused: context-length overflow (normal)"),
+        term("max-turns", "stopped by --max-turns cap"),
+        term("error(…)", "network or API error terminated the conversation"),
         Line::from(""),
         Line::from(Span::styled(
-            "press ? or Esc to close",
+            "  press  ?  ·  Esc  ·  or  q  to close",
             Style::default().fg(Color::DarkGray),
         )),
     ];
@@ -881,9 +978,8 @@ fn draw_help(frame: &mut ratatui::Frame) {
     );
 }
 
-// ---- small helpers --------------------------------------------------------
+// ── Small helpers ─────────────────────────────────────────────────────────────
 
-/// A centered rect of the given size, clamped to fit inside `area`.
 fn centered_fixed(area: Rect, w: u16, h: u16) -> Rect {
     let w = w.min(area.width);
     let h = h.min(area.height);
@@ -895,49 +991,23 @@ fn centered_fixed(area: Rect, w: u16, h: u16) -> Rect {
     }
 }
 
-fn gauge_color(ratio: f64) -> Color {
-    if ratio < 0.5 {
-        Color::Red
-    } else if ratio < 0.85 {
-        Color::Yellow
-    } else {
-        Color::Green
-    }
+fn ms_val(v: Option<f64>) -> String {
+    v.map_or_else(|| "—".to_string(), |x| format!("{x:.0}ms"))
 }
 
-fn opt(v: Option<f64>, unit: &str) -> String {
-    v.map_or_else(|| "—".to_string(), |x| format!("{x:.1} {unit}"))
+fn tps_val(v: Option<f64>) -> String {
+    v.map_or_else(|| "—".to_string(), |x| format!("{x:.1}"))
 }
 
-fn opt_secs(v: Option<f64>) -> String {
-    v.map_or_else(|| "—".to_string(), |x| format!("{x:.2}s"))
-}
-
-/// Build up to `bins` evenly-spaced e2e buckets with counts and `lo–hi` labels.
-fn histogram(samples: &[f64], bins: usize) -> Vec<(String, u64)> {
-    if samples.is_empty() || bins == 0 {
-        return vec![("—".to_string(), 0)];
-    }
-    let min = samples.iter().copied().fold(f64::INFINITY, f64::min);
-    let max = samples.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-    if (max - min).abs() < f64::EPSILON {
-        return vec![(format!("{min:.2}s"), samples.len() as u64)];
-    }
-    let width = (max - min) / bins as f64;
-    let mut counts = vec![0u64; bins];
-    for &s in samples {
-        let mut idx = ((s - min) / width) as usize;
-        if idx >= bins {
-            idx = bins - 1;
+fn fmt_thousands(n: u64) -> String {
+    let s = n.to_string();
+    let bytes = s.as_bytes();
+    let mut out = String::with_capacity(s.len() + s.len() / 3);
+    for (i, b) in bytes.iter().enumerate() {
+        if i > 0 && (bytes.len() - i).is_multiple_of(3) {
+            out.push(',');
         }
-        counts[idx] += 1;
+        out.push(*b as char);
     }
-    counts
-        .into_iter()
-        .enumerate()
-        .map(|(i, c)| {
-            let lo = min + width * i as f64;
-            (format!("{lo:.2}"), c)
-        })
-        .collect()
+    out
 }
