@@ -21,6 +21,9 @@ pub struct RunConfig {
     pub concurrency: usize,
     pub stream: bool,
     pub prompt: String,
+    /// Multi-turn conversation messages in `(role, content)` order.
+    /// Non-empty when `--message` flags were given; overrides `prompt`.
+    pub messages: Vec<(String, String)>,
     pub max_tokens: u32,
     pub temperature: Option<f32>,
     pub timeout: Duration,
@@ -48,6 +51,7 @@ impl RunConfig {
         warmup: usize,
         api_key: Option<String>,
         raw_headers: &[String],
+        raw_messages: &[String],
     ) -> Result<Self, ProbeError> {
         // `requests == 0` is valid and means "run indefinitely".
         if concurrency < 1 {
@@ -61,6 +65,7 @@ impl RunConfig {
         }
         let endpoint = resolve_endpoint(url)?;
         let headers = parse_headers(raw_headers)?;
+        let messages = parse_messages(raw_messages)?;
         Ok(Self {
             endpoint,
             model,
@@ -68,6 +73,7 @@ impl RunConfig {
             concurrency,
             stream,
             prompt,
+            messages,
             max_tokens,
             temperature,
             timeout: Duration::from_secs(timeout_secs),
@@ -114,6 +120,18 @@ fn parse_headers(raw: &[String]) -> Result<Vec<(String, String)>, ProbeError> {
                 ProbeError::Config(format!("header must be in 'Key: Value' form: {h}"))
             })?;
             Ok((k.trim().to_string(), v.trim().to_string()))
+        })
+        .collect()
+}
+
+/// Split `role: content` message strings; error on a missing colon.
+fn parse_messages(raw: &[String]) -> Result<Vec<(String, String)>, ProbeError> {
+    raw.iter()
+        .map(|m| {
+            let (role, content) = m.split_once(':').ok_or_else(|| {
+                ProbeError::Config(format!("message must be in 'role: content' form: {m}"))
+            })?;
+            Ok((role.trim().to_string(), content.trim().to_string()))
         })
         .collect()
 }
@@ -179,6 +197,7 @@ mod tests {
             0,
             None,
             &[],
+            &[],
         );
         assert!(ok.is_ok());
         // requests == 0 is valid and means "run indefinitely".
@@ -195,6 +214,7 @@ mod tests {
             0,
             None,
             &[],
+            &[],
         );
         assert!(infinite.is_ok());
         let bad_concurrency = RunConfig::build(
@@ -210,6 +230,7 @@ mod tests {
             0,
             None,
             &[],
+            &[],
         );
         assert!(bad_concurrency.is_err());
         let bad_timeout = RunConfig::build(
@@ -224,6 +245,7 @@ mod tests {
             0,
             0,
             None,
+            &[],
             &[],
         );
         assert!(bad_timeout.is_err());
