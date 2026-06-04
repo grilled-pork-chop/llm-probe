@@ -70,12 +70,20 @@ async fn send(
     tx: Option<&UnboundedSender<RunEvent>>,
     t0: Instant,
 ) -> Result<RequestOutcome, ProbeError> {
-    let body = ChatRequest {
-        model: &cfg.model,
-        messages: vec![Message {
+    let messages: Vec<Message> = if cfg.messages.is_empty() {
+        vec![Message {
             role: "user",
             content: &cfg.prompt,
-        }],
+        }]
+    } else {
+        cfg.messages
+            .iter()
+            .map(|(role, content)| Message { role, content })
+            .collect()
+    };
+    let body = ChatRequest {
+        model: &cfg.model,
+        messages,
         stream: cfg.stream,
         max_tokens: Some(cfg.max_tokens),
         temperature: cfg.temperature,
