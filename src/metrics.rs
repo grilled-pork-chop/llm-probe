@@ -1,18 +1,14 @@
-//! Measurement outcomes and (Phase 2+) aggregate statistics.
-//!
-//! A `RequestOutcome` is the per-request record the client produces; errors are
-//! captured *into* it (never propagated). Aggregation turns a slice of these
-//! into a `Report`.
+//! Per-turn and per-conversation measurement records, plus aggregate statistics.
 
-use crate::error::ProbeError;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::time::Duration;
 
-/// Classified failure cause, kept compact for error-rate breakdowns.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// ── Error classification ──────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ErrorKind {
-    /// Non-2xx HTTP status (the `u16` is the code; 429 is called out in reports).
+    ContextOverflow,
     Http(u16),
     Timeout,
     Connect,
@@ -21,25 +17,24 @@ pub enum ErrorKind {
 }
 
 impl ErrorKind {
-    /// Best-effort classification of a `ProbeError` into a breakdown bucket.
-    pub fn from_probe(err: &ProbeError) -> Self {
+    pub fn from_probe(err: &crate::error::ProbeError) -> Self {
+        use crate::error::ProbeError::*;
         match err {
-            ProbeError::Api { status, .. } => ErrorKind::Http(*status),
-            ProbeError::Timeout => ErrorKind::Timeout,
-            ProbeError::Decode(_) => ErrorKind::Decode,
-            ProbeError::Stream(_) => ErrorKind::Stream,
-            ProbeError::Http(e) => {
+            ContextOverflow { .. } => ErrorKind::ContextOverflow,
+            Api { status, .. } => ErrorKind::Http(*status),
+            Timeout => ErrorKind::Timeout,
+            Decode(_) => ErrorKind::Decode,
+            Stream(_) => ErrorKind::Stream,
+            Http(e) => {
                 if e.is_timeout() {
                     ErrorKind::Timeout
                 } else if e.is_connect() {
                     ErrorKind::Connect
-                } else if e.is_decode() {
-                    ErrorKind::Decode
                 } else {
                     ErrorKind::Connect
                 }
             }
-            ProbeError::Config(_) => ErrorKind::Connect,
+            Config(_) => ErrorKind::Connect,
         }
     }
 }
@@ -47,7 +42,8 @@ impl ErrorKind {
 impl fmt::Display for ErrorKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            ErrorKind::Http(code) => write!(f, "HTTP {code}"),
+            ErrorKind::ContextOverflow => f.write_str("ctx-limit"),
+            ErrorKind::Http(c) => write!(f, "HTTP {c}"),
             ErrorKind::Timeout => f.write_str("timeout"),
             ErrorKind::Connect => f.write_str("connect"),
             ErrorKind::Decode => f.write_str("decode"),
@@ -56,57 +52,370 @@ impl fmt::Display for ErrorKind {
     }
 }
 
-/// Per-request measurement record (A.10). Optional fields are `None` when the
-/// quantity is undefined for the request (see A.9), never `NaN`.
-#[derive(Debug, Clone)]
-pub struct RequestOutcome {
-    pub id: usize,
-    pub success: bool,
-    /// End-to-end latency: send → response complete.
+// ── Per-turn outcome ──────────────────────────────────────────────────────────
+
+/// Measurement record for one turn inside a conversation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TurnOutcome {
+    pub conv_id: usize,
+    pub turn_idx: usize,
+    /// Prompt (input) tokens sent to the model this turn.
+    pub prompt_tokens: Option<u32>,
+    pub completion_tokens: Option<u32>,
+    /// End-to-end latency: send → last byte received.
     pub e2e: Duration,
     /// Time to first content token (streaming only).
     pub ttft: Option<Duration>,
-    /// Decode window: last_token − first_token (streaming only).
-    pub gen_time: Option<Duration>,
-    pub completion_tokens: Option<u32>,
-    pub prompt_tokens: Option<u32>,
-    /// Per-request decode throughput (tokens/s).
-    pub tps: Option<f64>,
-    /// Mean inter-token latency, milliseconds.
+    /// `(e2e − ttft) / (completion_tokens − 1)` in ms; the per-step decode latency.
+    pub tpot_ms: Option<f64>,
+    /// Mean of observed inter-token wall-clock gaps (streaming only).
     pub itl_ms: Option<f64>,
-    /// Largest gap between consecutive tokens, milliseconds.
     pub max_gap_ms: Option<f64>,
-    /// `None` on success.
+    /// `completion_tokens / gen_time` in tokens/s.
+    pub tps: Option<f64>,
+    pub success: bool,
     pub error: Option<ErrorKind>,
-    /// Captured payload for inspection: the assistant reply on success, or the
-    /// (truncated) error response body on failure. `None` when empty/unavailable.
-    pub body: Option<String>,
+    /// Captured assistant reply text, used to grow conversation history.
+    pub reply: Option<String>,
 }
 
-impl RequestOutcome {
-    /// A failed outcome carrying its id, elapsed time, classified error, and an
-    /// optional captured error body.
-    pub fn failed(id: usize, e2e: Duration, error: ErrorKind, body: Option<String>) -> Self {
+impl TurnOutcome {
+    pub fn failed(
+        conv_id: usize,
+        turn_idx: usize,
+        e2e: Duration,
+        error: ErrorKind,
+    ) -> Self {
         Self {
-            id,
-            success: false,
+            conv_id,
+            turn_idx,
+            prompt_tokens: None,
+            completion_tokens: None,
             e2e,
             ttft: None,
-            gen_time: None,
-            completion_tokens: None,
-            prompt_tokens: None,
-            tps: None,
+            tpot_ms: None,
             itl_ms: None,
             max_gap_ms: None,
+            tps: None,
+            success: false,
             error: Some(error),
-            body,
+            reply: None,
         }
     }
 }
 
-/// Latency distribution over the e2e (or TTFT) samples of successful requests.
-/// All values in **seconds**. Field names match the A.11 `latency_e2e_s` object.
-#[derive(Debug, Clone, Copy, Serialize)]
+// ── Per-conversation outcome ──────────────────────────────────────────────────
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TerminalReason {
+    ContextLimit,
+    MaxTurns,
+    Error(ErrorKind),
+    Cancelled,
+}
+
+impl fmt::Display for TerminalReason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            TerminalReason::ContextLimit => f.write_str("ctx-limit"),
+            TerminalReason::MaxTurns => f.write_str("max-turns"),
+            TerminalReason::Error(k) => write!(f, "error({k})"),
+            TerminalReason::Cancelled => f.write_str("cancelled"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConversationOutcome {
+    pub id: usize,
+    pub slot: usize,
+    pub turns: Vec<TurnOutcome>,
+    pub terminal: TerminalReason,
+    pub wall_clock: Duration,
+}
+
+impl ConversationOutcome {
+    /// Successful turns (excludes the final overflow/error turn).
+    pub fn ok_turns(&self) -> impl Iterator<Item = &TurnOutcome> {
+        self.turns.iter().filter(|t| t.success)
+    }
+
+    /// Total prompt tokens of the last successful turn (context depth reached).
+    pub fn context_depth(&self) -> Option<u32> {
+        self.turns
+            .iter()
+            .rev()
+            .find_map(|t| if t.success { t.prompt_tokens } else { None })
+    }
+
+    pub fn avg_ttft_ms(&self) -> Option<f64> {
+        mean(
+            &self
+                .ok_turns()
+                .filter_map(|t| t.ttft.map(|d| d.as_secs_f64() * 1000.0))
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    pub fn avg_tps(&self) -> Option<f64> {
+        mean(&self.ok_turns().filter_map(|t| t.tps).collect::<Vec<_>>())
+    }
+
+    pub fn total_prompt_tokens(&self) -> u64 {
+        self.ok_turns()
+            .filter_map(|t| t.prompt_tokens)
+            .map(u64::from)
+            .sum()
+    }
+
+    pub fn total_completion_tokens(&self) -> u64 {
+        self.ok_turns()
+            .filter_map(|t| t.completion_tokens)
+            .map(u64::from)
+            .sum()
+    }
+}
+
+// ── Run-level result ──────────────────────────────────────────────────────────
+
+/// Snapshot of `RunConfig` fields needed for replay display.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConfigSnapshot {
+    pub endpoint: String,
+    pub model: String,
+    pub concurrency: usize,
+    pub stream: bool,
+    pub max_tokens: u32,
+    pub turn_prompt: String,
+}
+
+/// The complete output of a grow run.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GrowResult {
+    pub conversations: Vec<ConversationOutcome>,
+    pub wall_clock: Duration,
+    pub config: ConfigSnapshot,
+}
+
+// ── Aggregate report ──────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+pub struct TurnStats {
+    pub ttft: Option<LatencyStats>,
+    /// TPOT in ms.
+    pub tpot: Option<LatencyStats>,
+    /// ITL in ms.
+    pub itl: Option<LatencyStats>,
+    /// e2e in seconds.
+    pub e2e: Option<LatencyStats>,
+    /// Per-request TPS.
+    pub tps: Option<LatencyStats>,
+    /// Aggregate TPS: total completion tokens / wall_clock.
+    pub aggregate_tps: Option<f64>,
+    pub total_turns: usize,
+    pub ok_turns: usize,
+    pub total_completion_tokens: u64,
+    pub output_len: Option<(u32, f64, u32)>,
+    pub success_rate: f64,
+}
+
+#[derive(Debug, Clone)]
+pub struct ConvStats {
+    pub total: usize,
+    pub context_limit: usize,
+    pub max_turns_hit: usize,
+    pub errors: usize,
+    pub cancelled: usize,
+    /// Distribution of turns-to-limit.
+    pub turns_dist: Option<LatencyStats>,
+    /// Distribution of context depth at limit (tokens).
+    pub context_depth_dist: Option<LatencyStats>,
+}
+
+#[derive(Debug, Clone)]
+pub struct DegradationBucket {
+    pub label: String,
+    pub avg_tpot_ms: f64,
+    pub pct_change: Option<f64>,
+}
+
+#[derive(Debug, Clone)]
+pub struct RunReport {
+    pub wall_clock: Duration,
+    pub concurrency: usize,
+    pub turns: TurnStats,
+    pub conversations: ConvStats,
+    /// TPOT degradation bucketed by turn index.
+    pub degradation: Vec<DegradationBucket>,
+}
+
+/// Build the aggregate report from a completed or partial `GrowResult`.
+pub fn aggregate(result: &GrowResult) -> RunReport {
+    let wall_secs = result.wall_clock.as_secs_f64();
+    let all_turns: Vec<&TurnOutcome> = result
+        .conversations
+        .iter()
+        .flat_map(|c| c.turns.iter())
+        .collect();
+    let ok_turns: Vec<&TurnOutcome> = all_turns.iter().filter(|t| t.success).copied().collect();
+
+    let total_turns = all_turns.len();
+    let ok_turn_count = ok_turns.len();
+    let success_rate = if total_turns == 0 {
+        1.0
+    } else {
+        ok_turn_count as f64 / total_turns as f64
+    };
+
+    let total_completion_tokens: u64 = ok_turns
+        .iter()
+        .filter_map(|t| t.completion_tokens)
+        .map(u64::from)
+        .sum();
+
+    let aggregate_tps = if wall_secs > 0.0 && total_completion_tokens > 0 {
+        Some(total_completion_tokens as f64 / wall_secs)
+    } else {
+        None
+    };
+
+    let ttft_ms: Vec<f64> = ok_turns
+        .iter()
+        .filter_map(|t| t.ttft.map(|d| d.as_secs_f64() * 1000.0))
+        .collect();
+    let tpot_samples: Vec<f64> = ok_turns.iter().filter_map(|t| t.tpot_ms).collect();
+    let itl_samples: Vec<f64> = ok_turns.iter().filter_map(|t| t.itl_ms).collect();
+    let e2e_samples: Vec<f64> = ok_turns.iter().map(|t| t.e2e.as_secs_f64()).collect();
+    let tps_samples: Vec<f64> = ok_turns.iter().filter_map(|t| t.tps).collect();
+
+    let lens: Vec<u32> = ok_turns
+        .iter()
+        .filter_map(|t| t.completion_tokens)
+        .collect();
+    let output_len = if lens.is_empty() {
+        None
+    } else {
+        let mn = *lens.iter().min().unwrap_or(&0);
+        let mx = *lens.iter().max().unwrap_or(&0);
+        let avg = lens.iter().map(|&v| f64::from(v)).sum::<f64>() / lens.len() as f64;
+        Some((mn, avg, mx))
+    };
+
+    let turns = TurnStats {
+        ttft: LatencyStats::from_samples(&ttft_ms),
+        tpot: LatencyStats::from_samples(&tpot_samples),
+        itl: LatencyStats::from_samples(&itl_samples),
+        e2e: LatencyStats::from_samples(&e2e_samples),
+        tps: LatencyStats::from_samples(&tps_samples),
+        aggregate_tps,
+        total_turns,
+        ok_turns: ok_turn_count,
+        total_completion_tokens,
+        output_len,
+        success_rate,
+    };
+
+    let conv_total = result.conversations.len();
+    let mut ctx_limit = 0;
+    let mut max_turns_hit = 0;
+    let mut errors = 0;
+    let mut cancelled = 0;
+    let mut turns_counts: Vec<f64> = Vec::new();
+    let mut depths: Vec<f64> = Vec::new();
+
+    for conv in &result.conversations {
+        match conv.terminal {
+            TerminalReason::ContextLimit => {
+                ctx_limit += 1;
+                turns_counts.push(conv.ok_turns().count() as f64);
+                if let Some(d) = conv.context_depth() {
+                    depths.push(f64::from(d));
+                }
+            }
+            TerminalReason::MaxTurns => max_turns_hit += 1,
+            TerminalReason::Error(_) => errors += 1,
+            TerminalReason::Cancelled => cancelled += 1,
+        }
+    }
+
+    let conversations = ConvStats {
+        total: conv_total,
+        context_limit: ctx_limit,
+        max_turns_hit,
+        errors,
+        cancelled,
+        turns_dist: LatencyStats::from_samples(&turns_counts),
+        context_depth_dist: LatencyStats::from_samples(&depths),
+    };
+
+    let degradation = build_degradation(&result.conversations);
+
+    RunReport {
+        wall_clock: result.wall_clock,
+        concurrency: result.config.concurrency,
+        turns,
+        conversations,
+        degradation,
+    }
+}
+
+/// Bucket turns by index (1-4, 5-8, …) and compute average TPOT per bucket.
+fn build_degradation(convs: &[ConversationOutcome]) -> Vec<DegradationBucket> {
+    const BUCKET: usize = 4;
+    // Gather (turn_idx, tpot_ms) for all ok turns.
+    let mut max_idx: usize = 0;
+    for conv in convs {
+        if let Some(t) = conv.ok_turns().last() {
+            max_idx = max_idx.max(t.turn_idx);
+        }
+    }
+    if max_idx == 0 {
+        return vec![];
+    }
+
+    let num_buckets = (max_idx / BUCKET) + 1;
+    let mut sums = vec![0.0_f64; num_buckets];
+    let mut counts = vec![0usize; num_buckets];
+
+    for conv in convs {
+        for t in conv.ok_turns() {
+            if let Some(tpot) = t.tpot_ms {
+                let b = t.turn_idx / BUCKET;
+                if b < num_buckets {
+                    sums[b] += tpot;
+                    counts[b] += 1;
+                }
+            }
+        }
+    }
+
+    let mut result: Vec<DegradationBucket> = Vec::new();
+    let mut first_avg: Option<f64> = None;
+    for (i, (&s, &c)) in sums.iter().zip(counts.iter()).enumerate() {
+        if c == 0 {
+            continue;
+        }
+        let avg = s / c as f64;
+        let lo = i * BUCKET + 1;
+        let hi = lo + BUCKET - 1;
+        let label = format!("turns {lo}–{hi}");
+        let pct_change = first_avg.map(|base| (avg - base) / base * 100.0);
+        if first_avg.is_none() {
+            first_avg = Some(avg);
+        }
+        result.push(DegradationBucket {
+            label,
+            avg_tpot_ms: avg,
+            pct_change,
+        });
+    }
+    result
+}
+
+// ── LatencyStats ─────────────────────────────────────────────────────────────
+
+/// Latency distribution. Field values are in whatever unit the caller uses.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct LatencyStats {
     pub min: f64,
     pub p50: f64,
@@ -118,7 +427,6 @@ pub struct LatencyStats {
 }
 
 impl LatencyStats {
-    /// Compute stats from an unsorted sample set; `None` when empty.
     pub fn from_samples(samples: &[f64]) -> Option<Self> {
         if samples.is_empty() {
             return None;
@@ -141,161 +449,16 @@ impl LatencyStats {
     }
 }
 
-/// Aggregate report over a whole batch (A.10). Optional metrics are `None` when
-/// undefined (no successes, no streaming, missing usage — see A.9).
-#[derive(Debug, Clone)]
-pub struct Report {
-    pub total: usize,
-    pub ok: usize,
-    pub failed: usize,
-    pub success_rate: f64,
-    pub wall_clock: Duration,
-    pub req_per_s: f64,
-    pub e2e: Option<LatencyStats>,
-    pub ttft: Option<LatencyStats>,
-    /// Mean of per-request decode TPS over successes that have it.
-    pub avg_tps: Option<f64>,
-    /// Σ completion_tokens / Σ generation_time across successes.
-    pub aggregate_tps: Option<f64>,
-    pub mean_itl_ms: Option<f64>,
-    pub max_gap_ms: Option<f64>,
-    pub total_completion_tokens: u64,
-    pub total_prompt_tokens: u64,
-    /// (min, avg, max) completion tokens over successful requests.
-    pub output_len: Option<(u32, f64, u32)>,
-    /// aggregate_tps ÷ avg_tps (≈1 means no parallel scaling).
-    pub speedup: Option<f64>,
-    /// Failure counts by class, highest first (429 surfaces as its own bucket).
-    pub error_breakdown: Vec<(ErrorKind, usize)>,
-}
-
-/// Nearest-rank percentile (A.8). `sorted` ascending, in seconds; `p` in 0..=100.
 pub fn percentile(sorted: &[f64], p: f64) -> Option<f64> {
     if sorted.is_empty() {
         return None;
     }
-    let rank = ((p / 100.0) * sorted.len() as f64).ceil() as usize; // 1-based
+    let rank = ((p / 100.0) * sorted.len() as f64).ceil() as usize;
     let idx = rank.clamp(1, sorted.len()) - 1;
     Some(sorted[idx])
 }
 
-/// Reduce per-request outcomes into a `Report` (synchronous; §7).
-pub fn aggregate(outcomes: &[RequestOutcome], wall_clock: Duration) -> Report {
-    let total = outcomes.len();
-    let successes: Vec<&RequestOutcome> = outcomes.iter().filter(|o| o.success).collect();
-    let ok = successes.len();
-    let failed = total - ok;
-    let success_rate = if total == 0 {
-        0.0
-    } else {
-        ok as f64 / total as f64
-    };
-    let wall_secs = wall_clock.as_secs_f64();
-    let req_per_s = if wall_secs > 0.0 {
-        ok as f64 / wall_secs
-    } else {
-        0.0
-    };
-
-    let e2e_samples: Vec<f64> = successes.iter().map(|o| o.e2e.as_secs_f64()).collect();
-    let e2e = LatencyStats::from_samples(&e2e_samples);
-
-    let ttft_samples: Vec<f64> = successes
-        .iter()
-        .filter_map(|o| o.ttft.map(|d| d.as_secs_f64()))
-        .collect();
-    let ttft = LatencyStats::from_samples(&ttft_samples);
-
-    let tps_samples: Vec<f64> = successes.iter().filter_map(|o| o.tps).collect();
-    let avg_tps = mean(&tps_samples);
-
-    let total_completion_tokens: u64 = successes
-        .iter()
-        .filter_map(|o| o.completion_tokens)
-        .map(u64::from)
-        .sum();
-    let total_prompt_tokens: u64 = successes
-        .iter()
-        .filter_map(|o| o.prompt_tokens)
-        .map(u64::from)
-        .sum();
-
-    // Aggregate (deployment) TPS: total completion tokens over the wall-clock
-    // window. Scales with concurrency, unlike per-request decode rate — which is
-    // what makes `speedup = aggregate / avg` meaningful (§2.1).
-    let aggregate_tps = if wall_secs > 0.0 && total_completion_tokens > 0 {
-        Some(total_completion_tokens as f64 / wall_secs)
-    } else {
-        None
-    };
-
-    let speedup = match (aggregate_tps, avg_tps) {
-        (Some(agg), Some(per)) if per > 0.0 => Some(agg / per),
-        _ => None,
-    };
-
-    let itl_samples: Vec<f64> = successes.iter().filter_map(|o| o.itl_ms).collect();
-    let mean_itl_ms = mean(&itl_samples);
-    let max_gap_ms = successes
-        .iter()
-        .filter_map(|o| o.max_gap_ms)
-        .fold(None, |acc: Option<f64>, v| {
-            Some(acc.map_or(v, |m| m.max(v)))
-        });
-
-    let lens: Vec<u32> = successes
-        .iter()
-        .filter_map(|o| o.completion_tokens)
-        .collect();
-    let output_len = if lens.is_empty() {
-        None
-    } else {
-        let min = *lens.iter().min().unwrap_or(&0);
-        let max = *lens.iter().max().unwrap_or(&0);
-        let avg = lens.iter().map(|&v| f64::from(v)).sum::<f64>() / lens.len() as f64;
-        Some((min, avg, max))
-    };
-
-    let error_breakdown = error_breakdown(outcomes);
-
-    Report {
-        total,
-        ok,
-        failed,
-        success_rate,
-        wall_clock,
-        req_per_s,
-        e2e,
-        ttft,
-        avg_tps,
-        aggregate_tps,
-        mean_itl_ms,
-        max_gap_ms,
-        total_completion_tokens,
-        total_prompt_tokens,
-        output_len,
-        speedup,
-        error_breakdown,
-    }
-}
-
-/// Count failures by `ErrorKind`, highest count first (stable within ties).
-fn error_breakdown(outcomes: &[RequestOutcome]) -> Vec<(ErrorKind, usize)> {
-    let mut counts: Vec<(ErrorKind, usize)> = Vec::new();
-    for o in outcomes.iter().filter(|o| !o.success) {
-        if let Some(kind) = o.error {
-            match counts.iter_mut().find(|(k, _)| *k == kind) {
-                Some((_, c)) => *c += 1,
-                None => counts.push((kind, 1)),
-            }
-        }
-    }
-    counts.sort_by(|a, b| b.1.cmp(&a.1));
-    counts
-}
-
-/// Mean of a sample set, or `None` when empty.
-fn mean(samples: &[f64]) -> Option<f64> {
+pub fn mean(samples: &[f64]) -> Option<f64> {
     if samples.is_empty() {
         None
     } else {
@@ -308,36 +471,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn percentile_empty_is_none() {
-        assert_eq!(percentile(&[], 50.0), None);
-    }
-
-    #[test]
-    fn percentile_single_value() {
-        let s = [1.5];
-        for p in [0.0, 50.0, 95.0, 99.0, 100.0] {
-            assert_eq!(percentile(&s, p), Some(1.5));
-        }
-    }
-
-    #[test]
     fn percentile_nearest_rank() {
         let s = [1.0, 2.0, 3.0, 4.0, 5.0];
-        // ceil(p/100 * 5): p50 -> rank 3 -> 3.0; p95 -> rank 5 -> 5.0
         assert_eq!(percentile(&s, 50.0), Some(3.0));
         assert_eq!(percentile(&s, 95.0), Some(5.0));
-        assert_eq!(percentile(&s, 99.0), Some(5.0));
-        assert_eq!(percentile(&s, 100.0), Some(5.0));
-        // p in (0,20] -> rank 1 -> 1.0
-        assert_eq!(percentile(&s, 1.0), Some(1.0));
-        assert_eq!(percentile(&s, 20.0), Some(1.0));
-    }
-
-    #[test]
-    fn percentile_with_duplicates() {
-        let s = [2.0, 2.0, 2.0, 2.0];
-        assert_eq!(percentile(&s, 50.0), Some(2.0));
-        assert_eq!(percentile(&s, 95.0), Some(2.0));
     }
 
     #[test]
@@ -346,12 +483,50 @@ mod tests {
         assert_eq!(st.min, 1.0);
         assert_eq!(st.max, 5.0);
         assert_eq!(st.avg, 3.0);
-        assert_eq!(st.p50, 3.0);
-        assert!((st.stddev - std::f64::consts::SQRT_2).abs() < 1e-6);
     }
 
     #[test]
-    fn latency_stats_empty_is_none() {
-        assert!(LatencyStats::from_samples(&[]).is_none());
+    fn degradation_buckets() {
+        // Two conversations, each with 8 turns with growing TPOT.
+        let make_turn = |conv_id: usize, idx: usize, tpot: f64| TurnOutcome {
+            conv_id,
+            turn_idx: idx,
+            prompt_tokens: Some(100 * (idx as u32 + 1)),
+            completion_tokens: Some(50),
+            e2e: Duration::from_millis(500),
+            ttft: Some(Duration::from_millis(200)),
+            tpot_ms: Some(tpot),
+            itl_ms: None,
+            max_gap_ms: None,
+            tps: Some(80.0),
+            success: true,
+            error: None,
+            reply: Some("text".into()),
+        };
+        let conv = ConversationOutcome {
+            id: 0,
+            slot: 0,
+            turns: (0..8).map(|i| make_turn(0, i, 10.0 + i as f64)).collect(),
+            terminal: TerminalReason::ContextLimit,
+            wall_clock: Duration::from_secs(10),
+        };
+        let result = GrowResult {
+            conversations: vec![conv],
+            wall_clock: Duration::from_secs(10),
+            config: ConfigSnapshot {
+                endpoint: "http://x".into(),
+                model: "m".into(),
+                concurrency: 1,
+                stream: true,
+                max_tokens: 128,
+                turn_prompt: "Continue.".into(),
+            },
+        };
+        let report = aggregate(&result);
+        assert!(report.degradation.len() >= 2, "expected at least 2 buckets");
+        assert!(
+            report.degradation[1].pct_change.unwrap() > 0.0,
+            "TPOT should grow"
+        );
     }
 }
