@@ -268,6 +268,12 @@ async fn stream_response(
     let ttft = t_first.map(|t| t.saturating_duration_since(t0));
     let gen_time = match (t_first, t_last) {
         (Some(f), Some(l)) if l > f => Some(l.saturating_duration_since(f)),
+        // Single-chunk response: all content arrived in one SSE event so
+        // t_first == t_last. Fall back to e2e minus TTFT as the decode window
+        // so per-request TPS is still defined (common with GLM via vLLM).
+        (Some(_), Some(_)) => ttft
+            .map(|t| e2e.saturating_sub(t))
+            .filter(|d| !d.is_zero()),
         _ => None,
     };
     let gen_secs = gen_time.map(|d| d.as_secs_f64()).filter(|s| *s > 0.0);

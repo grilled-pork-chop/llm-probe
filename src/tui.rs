@@ -350,7 +350,7 @@ impl TuiState {
                 // Only finite runs complete; an infinite run keeps going.
                 if !self.infinite() && self.finished >= self.total && !self.done {
                     self.done = true;
-                    self.final_elapsed = Some(self.start.elapsed());
+                    self.final_elapsed = Some(self.elapsed());
                 }
             }
         }
