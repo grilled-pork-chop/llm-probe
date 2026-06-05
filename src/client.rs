@@ -66,7 +66,9 @@ async fn send(
         messages: msg_refs,
         stream: cfg.stream,
         max_tokens: cfg.max_tokens,
-        stream_options: cfg.stream.then_some(StreamOptions { include_usage: true }),
+        stream_options: cfg.stream.then_some(StreamOptions {
+            include_usage: true,
+        }),
     };
 
     let mut req = client.post(&cfg.endpoint).json(&body);
@@ -179,9 +181,7 @@ impl SseDecoder {
                     .content
                     .as_deref()
                     .filter(|s| !s.is_empty())
-                    .or_else(|| {
-                        choice.delta.reasoning.as_deref().filter(|s| !s.is_empty())
-                    });
+                    .or_else(|| choice.delta.reasoning.as_deref().filter(|s| !s.is_empty()));
                 if let Some(t) = text {
                     events.push(SseEvent::Content(t.to_owned()));
                 }
@@ -237,9 +237,7 @@ async fn stream_response(
     let gen_time = match (t_first, t_last) {
         (Some(f), Some(l)) if l > f => Some(l.saturating_duration_since(f)),
         // Single-chunk: fall back to e2e − TTFT as the decode window.
-        (Some(_), Some(_)) => ttft
-            .map(|t| e2e.saturating_sub(t))
-            .filter(|d| !d.is_zero()),
+        (Some(_), Some(_)) => ttft.map(|t| e2e.saturating_sub(t)).filter(|d| !d.is_zero()),
         _ => None,
     };
     let gen_secs = gen_time.map(|d| d.as_secs_f64()).filter(|s| *s > 0.0);
@@ -344,7 +342,11 @@ mod tests {
     #[test]
     fn reassembles_payload_split_across_reads() {
         let mut d = SseDecoder::default();
-        assert!(d.feed(b"data: {\"choices\":[{\"delta\":{\"con").unwrap().is_empty());
+        assert!(
+            d.feed(b"data: {\"choices\":[{\"delta\":{\"con")
+                .unwrap()
+                .is_empty()
+        );
         assert!(d.feed(b"tent\":\"split\"}}]}").unwrap().is_empty());
         let events = d.feed(b"\n").unwrap();
         assert_eq!(contents(&events), vec!["split"]);

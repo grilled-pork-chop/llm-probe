@@ -11,14 +11,15 @@ use std::time::Duration;
 use axum::Router;
 use axum::body::{Body, Bytes};
 use axum::extract::State;
-use axum::http::{header, StatusCode};
+use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use futures_util::StreamExt;
 use futures_util::stream;
 
 use llmprobe::config::RunConfig;
-use llmprobe::metrics::{TerminalReason, aggregate};
+use llmprobe::metrics::{ErrorKind, TerminalReason, aggregate};
+use llmprobe::prompts::PromptSampler;
 use llmprobe::runner::run_grow;
 
 use wiremock::matchers::{method, path};
@@ -132,10 +133,7 @@ async fn recording_handler(
     State(log): State<MessageLog>,
     axum::extract::Json(body): axum::extract::Json<serde_json::Value>,
 ) -> Response {
-    let msg_count = body["messages"]
-        .as_array()
-        .map(|a| a.len())
-        .unwrap_or(0);
+    let msg_count = body["messages"].as_array().map(|a| a.len()).unwrap_or(0);
 
     let mut lock = log.lock().await;
     lock.push(msg_count);
@@ -259,7 +257,12 @@ async fn max_turns_cap_stops_conversation() {
             "conv {} should end at max-turns cap",
             conv.id
         );
-        assert_eq!(conv.turns.len(), 3, "conv {} should have exactly 3 turns", conv.id);
+        assert_eq!(
+            conv.turns.len(),
+            3,
+            "conv {} should have exactly 3 turns",
+            conv.id
+        );
         assert!(
             conv.turns.iter().all(|t| t.success),
             "all turns in conv {} should succeed",
@@ -269,9 +272,15 @@ async fn max_turns_cap_stops_conversation() {
 
     // Aggregate stats should reflect 6 successful turns total
     let report = aggregate(&result);
-    assert_eq!(report.turns.ok_turns, 6, "6 ok turns total (2 convs × 3 turns)");
+    assert_eq!(
+        report.turns.ok_turns, 6,
+        "6 ok turns total (2 convs × 3 turns)"
+    );
     assert_eq!(report.turns.total_turns, 6);
-    assert!((report.turns.success_rate - 1.0).abs() < 0.001, "100% success rate");
+    assert!(
+        (report.turns.success_rate - 1.0).abs() < 0.001,
+        "100% success rate"
+    );
 }
 
 // ── SSE streaming test ────────────────────────────────────────────────────────
@@ -312,12 +321,86 @@ async fn streaming_grow_populates_ttft_and_tps() {
     assert_eq!(conv.terminal, TerminalReason::MaxTurns);
 
     for turn in conv.turns.iter().filter(|t| t.success) {
-        assert!(turn.ttft.is_some(), "TTFT must be present for streaming turns");
-        assert!(turn.tps.is_some(), "TPS must be computed for streaming turns");
+        assert!(
+            turn.ttft.is_some(),
+            "TTFT must be present for streaming turns"
+        );
+        assert!(
+            turn.tps.is_some(),
+            "TPS must be computed for streaming turns"
+        );
         assert_eq!(turn.completion_tokens, Some(8));
     }
 
     let report = aggregate(&result);
     assert!(report.turns.ttft.is_some(), "aggregate TTFT present");
     assert!(report.turns.tps.is_some(), "aggregate TPS present");
+}
+
+// ── Test 6: seed reproducibility ─────────────────────────────────────────────
+
+#[test]
+fn seed_reproducibility() {
+    let mut a = PromptSampler::new(Some(42));
+    let mut b = PromptSampler::new(Some(42));
+
+    assert_eq!(
+        a.system(),
+        b.system(),
+        "system prompts must match for same seed"
+    );
+    assert_eq!(a.seed(), b.seed(), "seed turns must match for same seed");
+
+    for i in 0..10 {
+        assert_eq!(
+            a.next_followup(),
+            b.next_followup(),
+            "followup {i} must match for same seed"
+        );
+    }
+}
+
+// ── Test 7: timeout error classification ─────────────────────────────────────
+
+#[tokio::test]
+async fn timeout_produces_timeout_error_kind() {
+    use axum::extract::Request;
+
+    async fn hanging_handler(_req: Request) -> Response {
+        // Sleep longer than the request timeout to force a timeout error.
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        StatusCode::OK.into_response()
+    }
+
+    let app = Router::new().route("/v1/chat/completions", post(hanging_handler));
+    let url = spawn_app(app).await;
+
+    // 1-second timeout so the test completes quickly.
+    let cfg = RunConfig::build(
+        &url,
+        "test-model".into(),
+        1,
+        1,
+        false,
+        None,
+        0,
+        None,
+        None,
+        1,
+        None,
+        &[],
+    )
+    .expect("valid config");
+
+    let result = run_grow(&cfg, None, None).await.expect("run completes");
+    assert_eq!(result.conversations.len(), 1);
+    let conv = &result.conversations[0];
+    assert_eq!(conv.turns.len(), 1, "one turn attempted before timeout");
+    let turn = &conv.turns[0];
+    assert!(!turn.success, "turn must have failed");
+    assert_eq!(
+        turn.error,
+        Some(ErrorKind::Timeout),
+        "timeout must be classified as Timeout, not Connect"
+    );
 }

@@ -51,7 +51,9 @@ impl RunConfig {
             return Err(ProbeError::Config("timeout must be > 0".into()));
         }
         if matches!(max_tokens, Some(0)) {
-            return Err(ProbeError::Config("max-tokens must be >= 1 when set".into()));
+            return Err(ProbeError::Config(
+                "max-tokens must be >= 1 when set".into(),
+            ));
         }
         let endpoint = resolve_endpoint(url)?;
         let headers = parse_kv("header", ':', raw_headers)?;
@@ -98,9 +100,7 @@ fn parse_kv(kind: &str, sep: char, raw: &[String]) -> Result<Vec<(String, String
     raw.iter()
         .map(|s| {
             let (k, v) = s.split_once(sep).ok_or_else(|| {
-                ProbeError::Config(format!(
-                    "{kind} must be in 'key{sep} value' form: {s}"
-                ))
+                ProbeError::Config(format!("{kind} must be in 'key{sep} value' form: {s}"))
             })?;
             Ok((k.trim().to_string(), v.trim().to_string()))
         })
@@ -114,10 +114,22 @@ mod tests {
     #[test]
     fn url_truth_table() {
         let cases = [
-            ("http://localhost:8000",       "http://localhost:8000/v1/chat/completions"),
-            ("http://localhost:8000/v1",    "http://localhost:8000/v1/chat/completions"),
-            ("http://localhost:8000/v1/",   "http://localhost:8000/v1/chat/completions"),
-            ("https://api.x.ai/v1/chat/completions", "https://api.x.ai/v1/chat/completions"),
+            (
+                "http://localhost:8000",
+                "http://localhost:8000/v1/chat/completions",
+            ),
+            (
+                "http://localhost:8000/v1",
+                "http://localhost:8000/v1/chat/completions",
+            ),
+            (
+                "http://localhost:8000/v1/",
+                "http://localhost:8000/v1/chat/completions",
+            ),
+            (
+                "https://api.x.ai/v1/chat/completions",
+                "https://api.x.ai/v1/chat/completions",
+            ),
         ];
         for (input, want) in cases {
             assert_eq!(resolve_endpoint(input).unwrap(), want, "input={input}");
@@ -134,28 +146,70 @@ mod tests {
     #[test]
     fn kv_parsing() {
         let h = parse_kv("header", ':', &["X-A: 1".into(), "X-B:2".into()]).unwrap();
-        assert_eq!(h, vec![("X-A".into(), "1".into()), ("X-B".into(), "2".into())]);
+        assert_eq!(
+            h,
+            vec![("X-A".into(), "1".into()), ("X-B".into(), "2".into())]
+        );
         assert!(parse_kv("header", ':', &["bad".into()]).is_err());
     }
 
     #[test]
     fn build_accepts_valid_config() {
-        assert!(RunConfig::build(
-            "http://x", "m".into(), 0, 1, false,
-            None, 0, None, None, 1, None, &[],
-        ).is_ok());
+        assert!(
+            RunConfig::build(
+                "http://x",
+                "m".into(),
+                0,
+                1,
+                false,
+                None,
+                0,
+                None,
+                None,
+                1,
+                None,
+                &[],
+            )
+            .is_ok()
+        );
     }
 
     #[test]
     fn build_rejects_bad_values() {
-        assert!(RunConfig::build(
-            "http://x", "m".into(), 0, 0, false,
-            None, 0, None, None, 1, None, &[],
-        ).is_err()); // concurrency=0
+        assert!(
+            RunConfig::build(
+                "http://x",
+                "m".into(),
+                0,
+                0,
+                false,
+                None,
+                0,
+                None,
+                None,
+                1,
+                None,
+                &[],
+            )
+            .is_err()
+        ); // concurrency=0
 
-        assert!(RunConfig::build(
-            "http://x", "m".into(), 0, 1, false,
-            None, 0, None, None, 0, None, &[],
-        ).is_err()); // timeout=0
+        assert!(
+            RunConfig::build(
+                "http://x",
+                "m".into(),
+                0,
+                1,
+                false,
+                None,
+                0,
+                None,
+                None,
+                0,
+                None,
+                &[],
+            )
+            .is_err()
+        ); // timeout=0
     }
 }

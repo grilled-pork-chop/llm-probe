@@ -14,6 +14,8 @@ pub enum ErrorKind {
     Connect,
     Decode,
     Stream,
+    /// Invalid configuration detected before any HTTP request was made.
+    Config,
 }
 
 impl ErrorKind {
@@ -32,7 +34,7 @@ impl ErrorKind {
                     ErrorKind::Connect
                 }
             }
-            Config(_) => ErrorKind::Connect,
+            Config(_) => ErrorKind::Config,
         }
     }
 }
@@ -46,6 +48,7 @@ impl fmt::Display for ErrorKind {
             ErrorKind::Connect => f.write_str("connect"),
             ErrorKind::Decode => f.write_str("decode"),
             ErrorKind::Stream => f.write_str("stream"),
+            ErrorKind::Config => f.write_str("config"),
         }
     }
 }
@@ -77,12 +80,7 @@ pub struct TurnOutcome {
 }
 
 impl TurnOutcome {
-    pub fn failed(
-        conv_id: usize,
-        turn_idx: usize,
-        e2e: Duration,
-        error: ErrorKind,
-    ) -> Self {
+    pub fn failed(conv_id: usize, turn_idx: usize, e2e: Duration, error: ErrorKind) -> Self {
         Self {
             conv_id,
             turn_idx,

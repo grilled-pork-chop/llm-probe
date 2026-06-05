@@ -9,9 +9,11 @@
 
 use crate::client::{build_client, send_turn};
 use crate::config::RunConfig;
-use crate::prompts::PromptSampler;
 use crate::error::ProbeError;
-use crate::metrics::{ConfigSnapshot, ConversationOutcome, GrowResult, TerminalReason, TurnOutcome};
+use crate::metrics::{
+    ConfigSnapshot, ConversationOutcome, GrowResult, TerminalReason, TurnOutcome,
+};
+use crate::prompts::PromptSampler;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
@@ -74,11 +76,17 @@ pub async fn run_grow(
         let outcomes = outcomes.clone();
 
         handles.push(tokio::spawn(async move {
-            slot_loop(
-                slot, &client, &cfg, tx.as_ref(), pause.as_ref(),
-                &completed, &next_conv_id, total, &outcomes,
-            )
-            .await;
+            let ctx = SlotCtx {
+                client: &client,
+                cfg: &cfg,
+                tx: tx.as_ref(),
+                pause: pause.as_ref(),
+                completed: &completed,
+                next_conv_id: &next_conv_id,
+                total,
+                outcomes: &outcomes,
+            };
+            slot_loop(slot, ctx).await;
         }));
     }
 
@@ -114,45 +122,48 @@ pub async fn run_grow(
     })
 }
 
-async fn slot_loop(
-    slot: usize,
-    client: &reqwest::Client,
-    cfg: &RunConfig,
-    tx: Option<&UnboundedSender<RunEvent>>,
-    pause: Option<&watch::Receiver<bool>>,
-    completed: &AtomicUsize,
-    next_conv_id: &AtomicUsize,
+/// Shared references passed to each slot task. Extracted to keep `slot_loop`
+/// within the function-argument limit and to make the ownership model explicit.
+struct SlotCtx<'a> {
+    client: &'a reqwest::Client,
+    cfg: &'a RunConfig,
+    tx: Option<&'a UnboundedSender<RunEvent>>,
+    pause: Option<&'a watch::Receiver<bool>>,
+    completed: &'a AtomicUsize,
+    next_conv_id: &'a AtomicUsize,
     total: usize,
-    outcomes: &tokio::sync::Mutex<Vec<ConversationOutcome>>,
-) {
+    outcomes: &'a tokio::sync::Mutex<Vec<ConversationOutcome>>,
+}
+
+async fn slot_loop(slot: usize, ctx: SlotCtx<'_>) {
     loop {
         // Check if we've hit the conversation target.
-        if total > 0 && completed.load(Ordering::Relaxed) >= total {
+        if ctx.total > 0 && ctx.completed.load(Ordering::Relaxed) >= ctx.total {
             break;
         }
 
-        let conv_id = next_conv_id.fetch_add(1, Ordering::Relaxed);
+        let conv_id = ctx.next_conv_id.fetch_add(1, Ordering::Relaxed);
 
         // Re-check after claiming the id (avoids racing past the limit).
-        if total > 0 && conv_id >= total {
+        if ctx.total > 0 && conv_id >= ctx.total {
             break;
         }
 
-        if let Some(tx) = tx {
+        if let Some(tx) = ctx.tx {
             let _ = tx.send(RunEvent::ConvStarted { conv_id, slot });
         }
 
-        let conv = run_conversation(slot, conv_id, client, cfg, tx, pause).await;
+        let conv = run_conversation(slot, conv_id, ctx.client, ctx.cfg, ctx.tx, ctx.pause).await;
 
-        if let Some(tx) = tx {
+        if let Some(tx) = ctx.tx {
             let _ = tx.send(RunEvent::ConvFinished {
                 conv_id,
                 outcome: conv.clone(),
             });
         }
 
-        outcomes.lock().await.push(conv);
-        completed.fetch_add(1, Ordering::Relaxed);
+        ctx.outcomes.lock().await.push(conv);
+        ctx.completed.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -169,7 +180,10 @@ async fn run_conversation(
     let mut sampler = PromptSampler::new(cfg.rng_seed);
 
     // System prompt: fixed override or random pool sample.
-    let system = cfg.system_prompt.as_deref().unwrap_or_else(|| sampler.system());
+    let system = cfg
+        .system_prompt
+        .as_deref()
+        .unwrap_or_else(|| sampler.system());
 
     // Build initial messages: optional system turn + pool seed.
     let mut messages: Vec<(String, String)> = {
@@ -229,7 +243,7 @@ async fn run_conversation(
         // Append assistant reply and follow-up user turn to grow the conversation.
         let assistant_text = reply.unwrap_or_default();
         messages.push(("assistant".into(), assistant_text));
-        messages.push(("user".into(), sampler.next().to_owned()));
+        messages.push(("user".into(), sampler.next_followup().to_owned()));
     };
 
     ConversationOutcome {

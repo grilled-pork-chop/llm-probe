@@ -15,9 +15,7 @@ async fn main() -> ExitCode {
     let args = Args::parse();
 
     let json = args.json;
-    let color = !json
-        && std::env::var_os("NO_COLOR").is_none()
-        && std::io::stdout().is_terminal();
+    let color = !json && std::env::var_os("NO_COLOR").is_none() && std::io::stdout().is_terminal();
 
     // ── Replay mode: load file and display without running anything ──────────
     if let Some(ref path) = args.replay {
@@ -131,10 +129,10 @@ async fn main() -> ExitCode {
     };
 
     // Optional save.
-    if let Some(ref path) = args.output {
-        if let Err(e) = persist::save(path, &result) {
-            eprintln!("warning: could not save output: {e}");
-        }
+    if let Some(ref path) = args.output
+        && let Err(e) = persist::save(path, &result)
+    {
+        eprintln!("warning: could not save output: {e}");
     }
 
     let summary = aggregate(&result);

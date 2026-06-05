@@ -5,15 +5,21 @@
 //! conversation and samples follow-ups without immediate repeats, producing
 //! realistic cache-busting traffic that naturally grows toward the context limit.
 
+use rand::Rng;
 use rand::SeedableRng;
 use rand::rngs::SmallRng;
 use rand::seq::IndexedRandom;
 
+/// A single conversation category: one seed turn plus a pool of on-topic follow-ups.
 pub struct ConvTemplate {
+    /// Opening user message that starts the conversation.
     pub seed: &'static str,
+    /// Follow-up turns drawn from to grow the conversation within the same topic.
     pub followups: &'static [&'static str],
 }
 
+/// Per-conversation prompt state: picks a random template and system prompt at
+/// construction, then vends follow-ups without immediate repeats.
 pub struct PromptSampler {
     rng: SmallRng,
     template: &'static ConvTemplate,
@@ -29,9 +35,15 @@ impl PromptSampler {
             Some(s) => SmallRng::seed_from_u64(s),
             None => SmallRng::from_os_rng(),
         };
-        let template = TEMPLATES.choose(&mut rng).unwrap();
+        #[allow(clippy::expect_used)] // TEMPLATES is a non-empty static array
+        let template = TEMPLATES.choose(&mut rng).expect("TEMPLATES is non-empty");
         let system = SYSTEM_PROMPTS.choose(&mut rng).copied().unwrap_or("");
-        Self { rng, template, system, last: None }
+        Self {
+            rng,
+            template,
+            system,
+            last: None,
+        }
     }
 
     /// System prompt for this conversation (randomly chosen at construction).
@@ -39,18 +51,18 @@ impl PromptSampler {
         self.system
     }
 
-    /// First user turn for this conversation.
+    /// First user turn for this conversation (the template seed).
     pub fn seed(&self) -> &'static str {
         self.template.seed
     }
 
-    /// Subsequent user turns — random follow-up within the same category,
-    /// never the same index twice in a row.
-    pub fn next(&mut self) -> &'static str {
+    /// Next follow-up user turn — random within the same template category,
+    /// never the same index twice in a row to avoid immediate repetition.
+    pub fn next_followup(&mut self) -> &'static str {
         let pool = self.template.followups;
         let len = pool.len();
         loop {
-            let idx = (0..len).collect::<Vec<_>>().choose(&mut self.rng).copied().unwrap_or(0);
+            let idx = self.rng.random_range(0..len);
             if Some(idx) != self.last {
                 self.last = Some(idx);
                 return pool[idx];
@@ -60,7 +72,6 @@ impl PromptSampler {
 }
 
 pub static TEMPLATES: &[ConvTemplate] = &[
-
     // ── Python web scraping ───────────────────────────────────────────────────
     ConvTemplate {
         seed: "I want to build a production-grade web scraper in Python to collect product prices and availability from multiple e-commerce sites. What architecture should I use?",
@@ -82,7 +93,6 @@ pub static TEMPLATES: &[ConvTemplate] = &[
             "Show me how to build a simple dashboard in Grafana that shows scrape success rates and price trends.",
         ],
     },
-
     // ── REST API design ───────────────────────────────────────────────────────
     ConvTemplate {
         seed: "I need to design a REST API for a multi-tenant SaaS platform that handles billing, user management, and resource provisioning. Where do I start?",
@@ -104,7 +114,6 @@ pub static TEMPLATES: &[ConvTemplate] = &[
             "How should the API behave during planned maintenance — 503 with Retry-After or degraded mode?",
         ],
     },
-
     // ── Database optimization ─────────────────────────────────────────────────
     ConvTemplate {
         seed: "Our PostgreSQL database is struggling under load — queries that used to take 10ms now take 3 seconds at peak traffic. How do I systematically diagnose and fix this?",
@@ -126,7 +135,6 @@ pub static TEMPLATES: &[ConvTemplate] = &[
             "What should I monitor in Grafana to detect database degradation before users notice?",
         ],
     },
-
     // ── React frontend ────────────────────────────────────────────────────────
     ConvTemplate {
         seed: "I'm building a complex React application for real-time collaborative document editing. What state management and architecture choices should I make?",
@@ -148,7 +156,6 @@ pub static TEMPLATES: &[ConvTemplate] = &[
             "Set up error boundaries that degrade gracefully so one component crash doesn't lose user work.",
         ],
     },
-
     // ── Machine learning pipeline ─────────────────────────────────────────────
     ConvTemplate {
         seed: "I need to build an end-to-end ML pipeline to predict customer churn for a SaaS product. Walk me through the full process from raw data to production model.",
@@ -170,7 +177,6 @@ pub static TEMPLATES: &[ConvTemplate] = &[
             "Show me how to build a Grafana dashboard tracking model performance and business outcomes over time.",
         ],
     },
-
     // ── Docker & Kubernetes ───────────────────────────────────────────────────
     ConvTemplate {
         seed: "We're migrating a monolithic Python Django application to Kubernetes. What's the right migration strategy and how do I containerize it properly?",
@@ -192,7 +198,6 @@ pub static TEMPLATES: &[ConvTemplate] = &[
             "How do I debug a pod that's crashing — walk me through the full diagnostic process.",
         ],
     },
-
     // ── System design ─────────────────────────────────────────────────────────
     ConvTemplate {
         seed: "Design a URL shortening service like bit.ly that needs to handle 100,000 redirects per second globally with sub-10ms latency. Walk me through the full system.",
@@ -214,7 +219,6 @@ pub static TEMPLATES: &[ConvTemplate] = &[
             "Walk me through capacity planning: storage, bandwidth, and compute for 1 billion links.",
         ],
     },
-
     // ── Rust systems programming ──────────────────────────────────────────────
     ConvTemplate {
         seed: "I'm learning Rust coming from C++ and I want to build a high-performance TCP server. Help me understand the ownership model and how to structure the project.",
@@ -236,7 +240,6 @@ pub static TEMPLATES: &[ConvTemplate] = &[
             "How do I benchmark the server with criterion and avoid common microbenchmark pitfalls?",
         ],
     },
-
     // ── Go microservices ──────────────────────────────────────────────────────
     ConvTemplate {
         seed: "I'm building a payment processing microservice in Go. It needs to be highly reliable, handle idempotency, and integrate with Stripe. How do I structure this?",
@@ -258,7 +261,6 @@ pub static TEMPLATES: &[ConvTemplate] = &[
             "How do I implement PCI DSS compliance requirements in the codebase — what must I never log or store?",
         ],
     },
-
     // ── Distributed systems ───────────────────────────────────────────────────
     ConvTemplate {
         seed: "Explain the Raft consensus algorithm to me — I need to understand it deeply enough to implement it in my own distributed key-value store.",
@@ -280,7 +282,6 @@ pub static TEMPLATES: &[ConvTemplate] = &[
             "What are the latency implications of Raft at geographically distributed nodes and how do you mitigate them?",
         ],
     },
-
     // ── Security hardening ────────────────────────────────────────────────────
     ConvTemplate {
         seed: "Our startup just got a security audit back and we have a list of critical findings. Help me prioritise and fix them systematically.",
@@ -302,7 +303,6 @@ pub static TEMPLATES: &[ConvTemplate] = &[
             "How do I set up a responsible disclosure programme and handle incoming vulnerability reports?",
         ],
     },
-
     // ── Data engineering ──────────────────────────────────────────────────────
     ConvTemplate {
         seed: "I need to build a real-time data pipeline that ingests clickstream events from our web app, enriches them, and makes them available for analytics within 30 seconds. Design the architecture.",
@@ -324,7 +324,6 @@ pub static TEMPLATES: &[ConvTemplate] = &[
             "How do I implement cost optimisation — compression, compaction, and lifecycle policies?",
         ],
     },
-
     // ── Frontend performance ──────────────────────────────────────────────────
     ConvTemplate {
         seed: "Our Next.js e-commerce site has a Lighthouse performance score of 38 on mobile. Walk me through a systematic approach to improve it to 90+.",
@@ -346,7 +345,6 @@ pub static TEMPLATES: &[ConvTemplate] = &[
             "Implement server-side rendering vs static generation — decision framework and implementation for each page type.",
         ],
     },
-
     // ── Algorithm design ──────────────────────────────────────────────────────
     ConvTemplate {
         seed: "I'm preparing for FAANG-level algorithm interviews. Start me with a hard graph problem and explain the solution thoroughly.",
@@ -368,7 +366,6 @@ pub static TEMPLATES: &[ConvTemplate] = &[
             "Give me a hard interval scheduling problem and show me the greedy proof of correctness.",
         ],
     },
-
     // ── Refactoring legacy code ───────────────────────────────────────────────
     ConvTemplate {
         seed: "We inherited a 10-year-old PHP monolith with no tests, mixed concerns everywhere, and several critical features nobody understands. How do I modernise it without breaking production?",
@@ -390,7 +387,6 @@ pub static TEMPLATES: &[ConvTemplate] = &[
             "Design a migration plan that keeps the business shipping features while paying down this technical debt.",
         ],
     },
-
     // ── Cloud architecture AWS ────────────────────────────────────────────────
     ConvTemplate {
         seed: "We're building a new product on AWS and need to design a secure, scalable, cost-efficient architecture. We expect to grow from 0 to 1M users in 18 months.",
@@ -412,7 +408,6 @@ pub static TEMPLATES: &[ConvTemplate] = &[
             "Design the data lake architecture on S3 with proper partitioning, access control, and lifecycle policies.",
         ],
     },
-
     // ── Testing strategies ─────────────────────────────────────────────────────
     ConvTemplate {
         seed: "Our engineering team writes almost no tests and we're afraid to refactor anything. How do I build a testing culture and a practical test suite from scratch?",
@@ -434,7 +429,6 @@ pub static TEMPLATES: &[ConvTemplate] = &[
             "How do I enforce test quality — what goes in the PR review checklist for tests?",
         ],
     },
-
     // ── Natural language processing ───────────────────────────────────────────
     ConvTemplate {
         seed: "I want to build a semantic search engine for our internal knowledge base using embeddings and vector search. Walk me through the full architecture.",
@@ -456,7 +450,6 @@ pub static TEMPLATES: &[ConvTemplate] = &[
             "What are the cost trade-offs between self-hosted embedding models and API providers at scale?",
         ],
     },
-
     // ── Compiler design ───────────────────────────────────────────────────────
     ConvTemplate {
         seed: "I want to build a simple interpreted programming language as a learning project. Walk me through writing a lexer, parser, and interpreter from scratch.",
@@ -478,7 +471,6 @@ pub static TEMPLATES: &[ConvTemplate] = &[
             "Explain LLVM — how would I use it as a backend to compile my language to native code?",
         ],
     },
-
     // ── Linux administration ──────────────────────────────────────────────────
     ConvTemplate {
         seed: "I need to set up a production Linux server from scratch — harden it, configure it for a web application, and make it observable. Walk me through the full process.",
@@ -500,7 +492,6 @@ pub static TEMPLATES: &[ConvTemplate] = &[
             "Set up a cron job strategy that's reliable, logged, and doesn't create zombie processes.",
         ],
     },
-
     // ── GraphQL ───────────────────────────────────────────────────────────────
     ConvTemplate {
         seed: "We're adding a GraphQL API on top of an existing REST backend and PostgreSQL database. What's the right architecture and how do I avoid common pitfalls?",
@@ -522,7 +513,6 @@ pub static TEMPLATES: &[ConvTemplate] = &[
             "Compare code-first vs schema-first GraphQL — when to use each and tooling for both approaches.",
         ],
     },
-
     // ── Embedded systems ──────────────────────────────────────────────────────
     ConvTemplate {
         seed: "I want to build a battery-powered IoT sensor that measures temperature and humidity, stores data locally, and uploads it when WiFi is available. Walk me through the hardware and firmware design.",
@@ -544,7 +534,6 @@ pub static TEMPLATES: &[ConvTemplate] = &[
             "What security considerations are specific to IoT devices — secure boot, attestation, and key storage?",
         ],
     },
-
     // ── Serverless architecture ───────────────────────────────────────────────
     ConvTemplate {
         seed: "We want to build a document processing pipeline using serverless functions. Documents are uploaded by users, processed through several transformation steps, and results are stored for retrieval. Design the system.",
@@ -566,7 +555,6 @@ pub static TEMPLATES: &[ConvTemplate] = &[
             "Design the security model: VPC configuration, secrets access, and preventing function-to-function injection.",
         ],
     },
-
     // ── Monitoring & observability ────────────────────────────────────────────
     ConvTemplate {
         seed: "Our system has outages that we only find out about from customer complaints. Design a proper observability stack so we detect and diagnose incidents before users do.",
@@ -588,7 +576,6 @@ pub static TEMPLATES: &[ConvTemplate] = &[
             "How do I implement chaos engineering safely — starting with game days and moving to automated fault injection?",
         ],
     },
-
     // ── Personal finance for developers ──────────────────────────────────────
     ConvTemplate {
         seed: "I'm a software engineer in my late 20s earning $130k. I have no savings and I'm living paycheck to paycheck. Help me build a financial foundation from scratch.",
@@ -610,7 +597,6 @@ pub static TEMPLATES: &[ConvTemplate] = &[
             "How do I model financial independence — what net worth target lets me stop working if I want to?",
         ],
     },
-
     // ── Computer vision ───────────────────────────────────────────────────────
     ConvTemplate {
         seed: "I want to build an object detection system that identifies defects on a manufacturing assembly line in real time using a camera feed. Walk me through the design.",
@@ -632,7 +618,6 @@ pub static TEMPLATES: &[ConvTemplate] = &[
             "Design the edge deployment and update strategy for 50 cameras across multiple factory sites.",
         ],
     },
-
     // ── Open source contribution ──────────────────────────────────────────────
     ConvTemplate {
         seed: "I want to start contributing to open source to grow my skills and reputation. How do I find the right project and make my first meaningful contribution?",
@@ -654,7 +639,6 @@ pub static TEMPLATES: &[ConvTemplate] = &[
             "How has open source contribution helped developers get jobs, and how do I make my contributions visible?",
         ],
     },
-
     // ── Scientific computing ──────────────────────────────────────────────────
     ConvTemplate {
         seed: "I'm a physicist who knows Python but has never used it for serious numerical computing. I need to simulate a system of coupled differential equations. Where do I start?",
@@ -676,7 +660,6 @@ pub static TEMPLATES: &[ConvTemplate] = &[
             "How do I visualise high-dimensional simulation results — dimensionality reduction and interactive plots?",
         ],
     },
-
     // ── Git workflows ─────────────────────────────────────────────────────────
     ConvTemplate {
         seed: "Our team of 12 engineers is struggling with git — long-lived branches, frequent merge conflicts, and broken main. Help us design a better workflow.",
@@ -698,7 +681,6 @@ pub static TEMPLATES: &[ConvTemplate] = &[
             "How do I audit the git history to understand when and why a decision was made three years ago?",
         ],
     },
-
     // ── Mobile development ────────────────────────────────────────────────────
     ConvTemplate {
         seed: "I'm a web developer who needs to build a cross-platform mobile app. Should I use React Native, Flutter, or something else, and how do I get started?",
@@ -720,7 +702,6 @@ pub static TEMPLATES: &[ConvTemplate] = &[
             "How do I implement in-app purchases on both platforms and handle receipt validation securely?",
         ],
     },
-
     // ── Career in software ────────────────────────────────────────────────────
     ConvTemplate {
         seed: "I've been a software engineer for 3 years and I'm stuck at mid-level. What does it actually take to get promoted to senior engineer and what should I focus on?",
@@ -742,7 +723,6 @@ pub static TEMPLATES: &[ConvTemplate] = &[
             "What does a principal or staff engineer do — is that path right for me?",
         ],
     },
-
     // ── Cryptography ─────────────────────────────────────────────────────────
     ConvTemplate {
         seed: "I want to deeply understand modern cryptography — not just how to use the libraries, but how the algorithms actually work. Start from the fundamentals.",
@@ -764,7 +744,6 @@ pub static TEMPLATES: &[ConvTemplate] = &[
             "Implement a simple Diffie-Hellman exchange in Python from scratch using only modular arithmetic.",
         ],
     },
-
     // ── Game development ──────────────────────────────────────────────────────
     ConvTemplate {
         seed: "I want to build a 2D multiplayer game in Godot 4. Players explore a procedurally generated world and can fight each other. Walk me through the architecture.",
@@ -798,28 +777,24 @@ pub static SYSTEM_PROMPTS: &[&str] = &[
     "You are a principal engineer at a FAANG company conducting a deep technical review. For every topic, explain it as if writing internal documentation: include background context, the problem being solved, the solution in detail, edge cases, failure modes, and links to related concepts. Be exhaustive.",
     "You are a technical educator writing a textbook chapter. Every response should read like a well-structured chapter: introduction, core concepts with definitions, worked examples with full code, exercises, and a summary. Assume the reader is intelligent but unfamiliar with the topic.",
     "You are a meticulous code reviewer. When shown any code or asked about implementation, always provide: the naive approach first, then progressively more optimised solutions, full working code for each, Big-O analysis, memory usage analysis, and a comparison table of approaches.",
-
     // Verbose pedagogical styles
     "You are a Socratic tutor. Answer every question by first building intuition from first principles, then introducing formalism, then showing a concrete example, then a more complex example, and finally connecting to the broader landscape. Never skip steps.",
     "You are a systems thinking expert. For every topic, always explain: the components and their interactions, the feedback loops, the failure modes, the edge cases, and how the system behaves under stress. Use diagrams described in ASCII art where helpful.",
     "You are writing a detailed technical blog post in response to every question. Include: a hook, background context, the core explanation with code, real-world examples, benchmarks or measurements where relevant, gotchas, and a conclusion with takeaways.",
     "You are a staff engineer mentoring a junior engineer. Explain everything thoroughly as if they need to understand it deeply enough to debug it in production at 3am. Include war stories, common mistakes, and the reasoning behind every decision.",
     "You are an expert who believes strongly in showing rather than telling. For every explanation, provide at least three complete, runnable code examples that demonstrate different aspects of the concept. Comment every non-obvious line.",
-
     // Domain-specific verbose personas
     "You are a distributed systems expert. Always frame answers in terms of: consistency models, failure scenarios, network partition behaviour, latency trade-offs, and operational complexity. Include sequence diagrams described in text and discuss CAP theorem implications.",
     "You are a security engineer performing a threat model. For every system or code discussed, identify: the attack surface, potential vulnerabilities, mitigations, defence-in-depth strategies, and monitoring/detection approaches. Be thorough and assume a sophisticated attacker.",
     "You are a performance engineer. For every system or algorithm discussed, always cover: theoretical complexity, practical performance characteristics, profiling methodology, optimisation strategies from low-hanging fruit to advanced, and how to measure the improvement.",
     "You are an SRE writing a runbook. Structure every response as an operational document: overview, prerequisites, step-by-step procedure with expected outputs, troubleshooting section for common failures, rollback procedure, and success criteria.",
     "You are a database administrator with deep expertise. For every question, cover: the data model implications, query patterns and their performance, indexing strategy, transaction semantics, failure handling, backup and recovery, and monitoring.",
-
     // Extra verbose / comprehensive
     "You are an AI assistant that believes in completeness above all else. Never truncate an answer. If a question has multiple aspects, address all of them. If code is involved, always show the full file, not snippets. If there are trade-offs, enumerate all of them.",
     "You are a technical interviewer at a top company. For every topic, cover it at the depth expected for a principal-level interview: theory, implementation details, optimisations, real-world applications, and follow-up questions with their answers.",
     "You are writing an RFC (Request for Comments) document. Structure every response as a formal RFC: Abstract, Motivation, Detailed Design, Drawbacks, Alternatives Considered, Unresolved Questions, and Implementation Plan.",
     "You are an expert who communicates exclusively through detailed examples. For every concept, provide five progressively complex examples, each with full code, expected output, and an explanation of what it demonstrates. Never explain without showing.",
     "You are a technical writer producing documentation for a complex open source project. Every response should be formatted as official documentation: overview, quick start, detailed reference, configuration options, examples, FAQ, and troubleshooting.",
-
     // Reasoning-heavy personas (especially good for thinking models)
     "You are a rigorous engineer who thinks step by step. Before giving any answer, explicitly write out your reasoning process: what you know, what you need to figure out, the approach you'll take, and why. Then provide the full solution.",
     "You are an expert who stress-tests every idea. For every proposal or implementation, always ask: what can go wrong? What are the edge cases? What happens under load? What happens when dependencies fail? Provide solutions to each identified problem.",
@@ -827,4 +802,3 @@ pub static SYSTEM_PROMPTS: &[&str] = &[
     "You are a compiler for understanding — you take high-level questions and decompose them into their fundamental components, explain each component in depth, show how they compose, and then synthesise back to the original question with a complete answer.",
     "You are an expert debugger. For every technical problem, apply scientific method: form a hypothesis, design experiments to test it, show the test and result, revise the hypothesis, and repeat until the root cause is found. Document every step.",
 ];
-
