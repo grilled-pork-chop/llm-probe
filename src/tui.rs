@@ -36,6 +36,9 @@ const TICK: Duration = Duration::from_millis(80);
 const REPORT_TICK: Duration = Duration::from_millis(240);
 const SPARK_LEN: usize = 60;
 const MAX_CONV_ROWS: usize = 500;
+/// Fixed size of the conversation-detail modal.
+const DETAIL_W: u16 = 102;
+const DETAIL_H: u16 = 34;
 
 // ── Terminal guard ────────────────────────────────────────────────────────────
 
@@ -127,6 +130,39 @@ enum Phase {
     Replay,
 }
 
+/// Sort order for the conversation table, cycled with `s`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SortKey {
+    /// Most-recent conversation first (default).
+    Recent,
+    /// Most turns first.
+    Turns,
+    /// Slowest average TTFT first.
+    Ttft,
+    /// Slowest (lowest) average TPS first.
+    Tps,
+}
+
+impl SortKey {
+    fn next(self) -> Self {
+        match self {
+            SortKey::Recent => SortKey::Turns,
+            SortKey::Turns => SortKey::Ttft,
+            SortKey::Ttft => SortKey::Tps,
+            SortKey::Tps => SortKey::Recent,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            SortKey::Recent => "recent",
+            SortKey::Turns => "turns",
+            SortKey::Ttft => "TTFT",
+            SortKey::Tps => "TPS",
+        }
+    }
+}
+
 struct TuiState {
     start: Instant,
     cfg_snap: ConfigSnapshot,
@@ -139,6 +175,7 @@ struct TuiState {
     tps_hist: VecDeque<u64>,
     ttft_hist: VecDeque<u64>,
     selected: usize,
+    sort: SortKey,
     show_detail: bool,
     detail_scroll: u16,
     show_help: bool,
@@ -173,6 +210,7 @@ impl TuiState {
             tps_hist: VecDeque::with_capacity(SPARK_LEN),
             ttft_hist: VecDeque::with_capacity(SPARK_LEN),
             selected: 0,
+            sort: SortKey::Recent,
             show_detail: false,
             detail_scroll: 0,
             show_help: false,
@@ -197,6 +235,7 @@ impl TuiState {
             tps_hist: VecDeque::with_capacity(SPARK_LEN),
             ttft_hist: VecDeque::with_capacity(SPARK_LEN),
             selected: 0,
+            sort: SortKey::Recent,
             show_detail: false,
             detail_scroll: 0,
             show_help: false,
@@ -345,9 +384,43 @@ impl TuiState {
         for p in self.partial_convs.values() {
             rows.push(build_row(p.conv_id, p.slot, &p.turns, true, None));
         }
-        rows.sort_by(|a, b| b.conv_id.cmp(&a.conv_id));
+        // conv_id is the stable tie-breaker so equal rows never jitter, and
+        // rows missing the sort metric (`None`) always sink to the bottom.
+        match self.sort {
+            SortKey::Recent => rows.sort_by(|a, b| b.conv_id.cmp(&a.conv_id)),
+            SortKey::Turns => rows.sort_by(|a, b| {
+                b.turn_count
+                    .cmp(&a.turn_count)
+                    .then(b.conv_id.cmp(&a.conv_id))
+            }),
+            SortKey::Ttft => rows.sort_by(|a, b| {
+                // Slowest TTFT first: descending, None ranked lowest.
+                let av = a.avg_ttft_ms.unwrap_or(f64::NEG_INFINITY);
+                let bv = b.avg_ttft_ms.unwrap_or(f64::NEG_INFINITY);
+                bv.total_cmp(&av).then(b.conv_id.cmp(&a.conv_id))
+            }),
+            SortKey::Tps => rows.sort_by(|a, b| {
+                // Slowest TPS first: ascending, None ranked highest (last).
+                let av = a.avg_tps.unwrap_or(f64::INFINITY);
+                let bv = b.avg_tps.unwrap_or(f64::INFINITY);
+                av.total_cmp(&bv).then(b.conv_id.cmp(&a.conv_id))
+            }),
+        }
         rows.truncate(MAX_CONV_ROWS);
         rows
+    }
+
+    /// Largest valid scroll offset for the detail modal of the selected
+    /// conversation, so navigation can't run past the end of the content.
+    fn detail_max_scroll(&self) -> u16 {
+        // Detail box is DETAIL_H tall; subtract the two border rows for the
+        // visible viewport. Content = 6 fixed header/summary lines + one line
+        // per turn (an upper bound, so the last line is always reachable).
+        const VIEWPORT: usize = DETAIL_H as usize - 2;
+        let rows = self.conv_rows();
+        let selected = self.selected.min(rows.len().saturating_sub(1));
+        let lines = rows.get(selected).map_or(0, |r| 6 + r.turns.len());
+        lines.saturating_sub(VIEWPORT) as u16
     }
 }
 
@@ -479,9 +552,10 @@ fn handle_key(state: &mut TuiState, code: KeyCode, pause_tx: &watch::Sender<bool
                 state.detail_scroll = state.detail_scroll.saturating_sub(1);
             }
             KeyCode::Down | KeyCode::Char('j') => {
-                state.detail_scroll = state.detail_scroll.saturating_add(1);
+                state.detail_scroll = (state.detail_scroll + 1).min(state.detail_max_scroll());
             }
             KeyCode::Char('g') => state.detail_scroll = 0,
+            KeyCode::Char('G') => state.detail_scroll = state.detail_max_scroll(),
             _ => {}
         }
         return false;
@@ -496,6 +570,7 @@ fn handle_key(state: &mut TuiState, code: KeyCode, pause_tx: &watch::Sender<bool
             state.toggle_pause();
             let _ = pause_tx.send(state.paused);
         }
+        KeyCode::Char('s') => state.sort = state.sort.next(),
         KeyCode::Char('?') => state.show_help = true,
         KeyCode::Enter if row_count > 0 => {
             state.show_detail = true;
@@ -677,16 +752,27 @@ fn draw_sparklines(frame: &mut ratatui::Frame, area: Rect, state: &TuiState) {
         Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).split(area);
     let tps: Vec<u64> = state.tps_hist.iter().copied().collect();
     let ttft: Vec<u64> = state.ttft_hist.iter().copied().collect();
+
+    // A bare sparkline shape is unreadable without a scale, so surface the
+    // current and peak sample in each panel title.
+    let scale = |series: &[u64], unit: &str| {
+        let now = series.last().copied().unwrap_or(0);
+        let peak = series.iter().copied().max().unwrap_or(0);
+        format!("now {now}{unit} · peak {peak}{unit}")
+    };
+
+    let tps_title = format!("Agg TPS · {}", scale(&tps, ""));
     frame.render_widget(
         Sparkline::default()
-            .block(panel("Agg TPS history"))
+            .block(panel(&tps_title))
             .data(&tps)
             .style(Style::default().fg(ACCENT)),
         cols[0],
     );
+    let ttft_title = format!("TTFT avg · {}", scale(&ttft, "ms"));
     frame.render_widget(
         Sparkline::default()
-            .block(panel("TTFT avg ms"))
+            .block(panel(&ttft_title))
             .data(&ttft)
             .style(Style::default().fg(Color::Magenta)),
         cols[1],
@@ -795,7 +881,7 @@ fn draw_detail(frame: &mut ratatui::Frame, state: &TuiState, rows: &[ConvRow]) {
         return;
     };
 
-    let area = centered_fixed(frame.area(), 102, 34);
+    let area = centered_fixed(frame.area(), DETAIL_W, DETAIL_H);
     frame.render_widget(Clear, area);
 
     let head = Style::default().fg(ACCENT).add_modifier(Modifier::BOLD);
@@ -918,10 +1004,14 @@ fn draw_footer(frame: &mut ratatui::Frame, area: Rect, state: &TuiState) {
         Phase::Done => " [DONE]  q quit  ·  ↑/↓ select  ·  enter detail  ·  ? help",
         Phase::Live => " q quit  ·  space/p pause  ·  ↑/↓ select  ·  enter detail  ·  ? help",
     };
-    frame.render_widget(
-        Paragraph::new(text).style(Style::default().fg(Color::DarkGray)),
-        area,
-    );
+    let line = Line::from(vec![
+        Span::styled(text, Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            format!("  ·  s sort: {}", state.sort.label()),
+            Style::default().fg(ACCENT),
+        ),
+    ]);
+    frame.render_widget(Paragraph::new(line), area);
 }
 
 fn draw_help(frame: &mut ratatui::Frame) {
@@ -955,9 +1045,10 @@ fn draw_help(frame: &mut ratatui::Frame) {
 
     let lines = vec![
         section("KEYS"),
-        key("↑/↓  j/k", "navigate conversations"),
-        key("g  G", "jump to top / bottom of list"),
+        key("↑/↓  j/k", "navigate conversations (or scroll the detail view)"),
+        key("g  G", "jump to top / bottom of list or detail"),
         key("enter", "open turn-detail for selected conversation"),
+        key("s", "cycle sort: recent → turns → TTFT → TPS"),
         key("space / p", "pause / resume dispatch and freeze metrics"),
         key("?", "toggle this help overlay"),
         key("q / Esc", "quit and restore terminal (report printed after)"),
