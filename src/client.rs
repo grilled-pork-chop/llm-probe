@@ -141,7 +141,6 @@ async fn non_streaming(
         ttft: None,
         tpot_ms: None,
         itl_ms: None,
-        max_gap_ms: None,
         tps,
         success: true,
         error: None,
@@ -208,8 +207,6 @@ async fn stream_response(
     let mut decoder = SseDecoder::default();
     let mut t_first: Option<Instant> = None;
     let mut t_last: Option<Instant> = None;
-    let mut last_content: Option<Instant> = None;
-    let mut max_gap_ms = 0.0_f64;
     let mut usage: Option<Usage> = None;
     let mut reply = String::new();
 
@@ -221,25 +218,16 @@ async fn stream_response(
                         reply.push_str(&text);
                     }
                     let now = Instant::now();
-                    match (t_first, last_content) {
-                        (None, _) => {
-                            t_first = Some(now);
-                            if let Some(tx) = tx {
-                                let _ = tx.send(RunEvent::TurnFirstToken {
-                                    conv_id,
-                                    turn_idx,
-                                    ttft: now.saturating_duration_since(t0),
-                                });
-                            }
+                    if t_first.is_none() {
+                        t_first = Some(now);
+                        if let Some(tx) = tx {
+                            let _ = tx.send(RunEvent::TurnFirstToken {
+                                conv_id,
+                                turn_idx,
+                                ttft: now.saturating_duration_since(t0),
+                            });
                         }
-                        (Some(_), Some(prev)) => {
-                            let gap =
-                                now.saturating_duration_since(prev).as_secs_f64() * 1000.0;
-                            max_gap_ms = max_gap_ms.max(gap);
-                        }
-                        _ => {}
                     }
-                    last_content = Some(now);
                     t_last = Some(now);
                 }
                 SseEvent::Usage(u) => usage = Some(u),
@@ -279,7 +267,6 @@ async fn stream_response(
         (Some(c), Some(g)) if c > 1 => Some(g.as_secs_f64() * 1000.0 / f64::from(c - 1)),
         _ => None,
     };
-    let max_gap_ms = (max_gap_ms > 0.0).then_some(max_gap_ms);
     let reply = (!reply.is_empty()).then(|| cap_body(reply));
 
     Ok(TurnOutcome {
@@ -291,7 +278,6 @@ async fn stream_response(
         ttft,
         tpot_ms,
         itl_ms,
-        max_gap_ms,
         tps,
         success: true,
         error: None,
