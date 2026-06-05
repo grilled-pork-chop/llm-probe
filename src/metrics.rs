@@ -172,6 +172,25 @@ impl ConversationOutcome {
     }
 }
 
+/// Full message list sent to the API at `turn_idx`, reconstructed from the seed,
+/// the constant turn-prompt, and each prior turn's captured reply. Mirrors the
+/// growth loop in `runner::run_conversation`, so no per-turn request payload is
+/// stored — the replies we already keep are sufficient. Takes a `turns` slice so
+/// both completed and in-flight (partial) conversations can be reconstructed.
+pub fn request_messages(
+    turns: &[TurnOutcome],
+    turn_idx: usize,
+    seed: &[(String, String)],
+    turn_prompt: &str,
+) -> Vec<(String, String)> {
+    let mut msgs = seed.to_vec();
+    for t in turns.iter().take(turn_idx) {
+        msgs.push(("assistant".into(), t.reply.clone().unwrap_or_default()));
+        msgs.push(("user".into(), turn_prompt.into()));
+    }
+    msgs
+}
+
 // ── Run-level result ──────────────────────────────────────────────────────────
 
 /// Snapshot of `RunConfig` fields needed for replay display.
@@ -183,6 +202,11 @@ pub struct ConfigSnapshot {
     pub stream: bool,
     pub max_tokens: u32,
     pub turn_prompt: String,
+    /// Initial conversation seed as `(role, content)` pairs. Used to reconstruct
+    /// each turn's request in the TUI. `#[serde(default)]` keeps `GrowResult`
+    /// JSON saved before this field was added loadable for replay.
+    #[serde(default)]
+    pub seed_messages: Vec<(String, String)>,
 }
 
 /// The complete output of a grow run.
@@ -255,7 +279,13 @@ pub fn aggregate(result: &GrowResult) -> RunReport {
         .collect();
     let ok_turns: Vec<&TurnOutcome> = all_turns.iter().filter(|t| t.success).copied().collect();
 
-    let total_turns = all_turns.len();
+    // A context-overflow turn is the designed terminal of grow mode, not a
+    // failure, so it is excluded from the success-rate denominator. Real errors
+    // (HTTP, timeout, connect, decode, stream) still count.
+    let total_turns = all_turns
+        .iter()
+        .filter(|t| t.error != Some(ErrorKind::ContextOverflow))
+        .count();
     let ok_turn_count = ok_turns.len();
     let success_rate = if total_turns == 0 {
         1.0
@@ -515,6 +545,7 @@ mod tests {
                 stream: true,
                 max_tokens: 128,
                 turn_prompt: "Continue.".into(),
+                seed_messages: vec![("user".into(), "Start.".into())],
             },
         };
         let report = aggregate(&result);
@@ -522,6 +553,47 @@ mod tests {
         assert!(
             report.degradation[1].pct_change.unwrap() > 0.0,
             "TPOT should grow"
+        );
+    }
+
+    #[test]
+    fn request_messages_reconstructs_history() {
+        let turn = |idx: usize, reply: &str| TurnOutcome {
+            conv_id: 0,
+            turn_idx: idx,
+            prompt_tokens: Some(10),
+            completion_tokens: Some(5),
+            e2e: Duration::from_millis(100),
+            ttft: None,
+            tpot_ms: None,
+            itl_ms: None,
+            tps: None,
+            success: true,
+            error: None,
+            reply: Some(reply.into()),
+        };
+        let conv = ConversationOutcome {
+            id: 0,
+            slot: 0,
+            turns: vec![turn(0, "reply-0"), turn(1, "reply-1")],
+            terminal: TerminalReason::ContextLimit,
+            wall_clock: Duration::from_secs(1),
+        };
+        let seed = vec![("user".to_string(), "Start.".to_string())];
+
+        // Turn 0 sees only the seed.
+        assert_eq!(request_messages(&conv.turns, 0, &seed, "Continue."), seed);
+
+        // Turn 2 sees seed + interleaved (assistant reply, user turn-prompt).
+        assert_eq!(
+            request_messages(&conv.turns, 2, &seed, "Continue."),
+            vec![
+                ("user".into(), "Start.".into()),
+                ("assistant".into(), "reply-0".into()),
+                ("user".into(), "Continue.".into()),
+                ("assistant".into(), "reply-1".into()),
+                ("user".into(), "Continue.".into()),
+            ]
         );
     }
 }

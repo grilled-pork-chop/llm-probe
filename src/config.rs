@@ -33,6 +33,17 @@ pub struct RunConfig {
 }
 
 impl RunConfig {
+    /// Resolved initial conversation seed: the explicit `--message` pairs when
+    /// given, otherwise the single `--prompt` user turn. Single source of truth
+    /// for both the runner's growth loop and the replay/TUI request view.
+    pub fn seed_messages(&self) -> Vec<(String, String)> {
+        if self.messages.is_empty() {
+            vec![("user".into(), self.prompt.clone())]
+        } else {
+            self.messages.clone()
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn build(
         url: &str,
