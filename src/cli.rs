@@ -64,9 +64,9 @@ pub struct Args {
     #[arg(short = 'H', long = "header")]
     pub headers: Vec<String>,
 
-    /// Live TUI dashboard (requires the `tui` feature).
+    /// Disable the live TUI dashboard and print a plain-text report instead.
     #[arg(long)]
-    pub tui: bool,
+    pub no_tui: bool,
 
     /// Machine-readable JSON report.
     #[arg(long)]

@@ -30,7 +30,7 @@ async fn main() -> ExitCode {
         };
 
         #[cfg(feature = "tui")]
-        if args.tui {
+        if !args.no_tui {
             match llmprobe::tui::replay(&result).await {
                 Ok(()) => {}
                 Err(e) => {
@@ -103,13 +103,9 @@ async fn main() -> ExitCode {
         }
     };
 
-    #[cfg(not(feature = "tui"))]
-    if args.tui {
-        eprintln!("error: this build has no TUI support; rebuild with --features tui");
-        return ExitCode::from(1);
-    }
+    let use_tui = !args.no_tui && cfg!(feature = "tui");
 
-    let result = if args.tui {
+    let result = if use_tui {
         #[cfg(feature = "tui")]
         {
             match llmprobe::tui::run(&cfg).await {
