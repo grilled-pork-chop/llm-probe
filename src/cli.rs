@@ -2,7 +2,6 @@
 
 use clap::Parser;
 
-/// Default first user message when no -M flags are given.
 pub const DEFAULT_PROMPT: &str = "Write three sentences about the history of computing.";
 
 
@@ -37,9 +36,12 @@ pub struct Args {
     #[arg(long)]
     pub stream: bool,
 
-    /// Initial user message (seed for every conversation).
-    #[arg(short, long, default_value = DEFAULT_PROMPT)]
-    pub prompt: String,
+    /// Seed message for every conversation.
+    /// When omitted, each conversation starts with the seed from the built-in
+    /// prompt pool (varies per conversation). Provide this to fix a specific
+    /// starting topic for all conversations.
+    #[arg(short, long)]
+    pub prompt: Option<String>,
 
     /// Stop a conversation after this many turns regardless of context limit (0 = unlimited).
     #[arg(long = "max-turns", default_value_t = 0)]

@@ -16,8 +16,11 @@ pub struct RunConfig {
     /// Number of concurrent conversation slots.
     pub concurrency: usize,
     pub stream: bool,
-    /// Seed user message (used when `messages` is empty).
+    /// Seed user message override. When `prompt_is_default` is true the pool
+    /// seed is used instead and this field is ignored.
     pub prompt: String,
+    /// True when --prompt was not explicitly set — the pool provides the seed.
+    pub prompt_is_default: bool,
     /// Per-conversation turn cap; `0` = unlimited.
     pub max_turns_per_conv: usize,
     /// Initial conversation seed as `(role, content)` pairs.
@@ -50,6 +53,7 @@ impl RunConfig {
         concurrency: usize,
         stream: bool,
         prompt: String,
+        prompt_is_default: bool,
         max_turns_per_conv: usize,
         max_tokens: Option<u32>,
         temperature: Option<f32>,
@@ -77,6 +81,7 @@ impl RunConfig {
             concurrency,
             stream,
             prompt,
+            prompt_is_default,
             max_turns_per_conv,
             messages,
             max_tokens,
@@ -173,7 +178,7 @@ mod tests {
     fn build_accepts_valid_config() {
         let cfg = RunConfig::build(
             "http://x", "m".into(), 0, 1, false,
-            "p".into(), 0, None, None, 1, None, &[], &[],
+            "p".into(), true, 0, None, None, 1, None, &[], &[],
         );
         assert!(cfg.is_ok());
     }
@@ -182,12 +187,12 @@ mod tests {
     fn build_rejects_bad_values() {
         assert!(RunConfig::build(
             "http://x", "m".into(), 0, 0, false,
-            "p".into(), 0, None, None, 1, None, &[], &[],
+            "p".into(), true, 0, None, None, 1, None, &[], &[],
         ).is_err()); // concurrency=0
 
         assert!(RunConfig::build(
             "http://x", "m".into(), 0, 1, false,
-            "p".into(), 0, None, None, 0, None, &[], &[],
+            "p".into(), true, 0, None, None, 0, None, &[], &[],
         ).is_err()); // timeout=0
     }
 }

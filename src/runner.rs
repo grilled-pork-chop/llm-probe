@@ -169,8 +169,17 @@ async fn run_conversation(
 
     let mut sampler = PromptSampler::new();
 
-    // Build the initial message list from config seed.
-    let mut messages: Vec<(String, String)> = cfg.seed_messages();
+    // Use the pool seed unless the user provided an explicit --prompt override.
+    let seed = if cfg.prompt_is_default {
+        sampler.seed().to_owned()
+    } else {
+        cfg.prompt.clone()
+    };
+    let mut messages: Vec<(String, String)> = if cfg.messages.is_empty() {
+        vec![("user".into(), seed)]
+    } else {
+        cfg.seed_messages()
+    };
 
     let mut turns: Vec<TurnOutcome> = Vec::new();
 
