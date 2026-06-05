@@ -129,7 +129,10 @@ async fn non_streaming(
         .choices
         .into_iter()
         .next()
-        .and_then(|c| c.message.content)
+        .and_then(|c| {
+            let m = c.message;
+            m.content.filter(|s| !s.is_empty()).or(m.reasoning)
+        })
         .filter(|s| !s.is_empty())
         .map(cap_body);
     Ok(TurnOutcome {
@@ -182,11 +185,18 @@ impl SseDecoder {
             }
             let parsed: ChatChunk = serde_json::from_str(payload)
                 .map_err(|e| ProbeError::Stream(format!("bad SSE chunk: {e}")))?;
-            if let Some(choice) = parsed.choices.first()
-                && let Some(content) = &choice.delta.content
-                && !content.is_empty()
-            {
-                events.push(SseEvent::Content(content.clone()));
+            if let Some(choice) = parsed.choices.first() {
+                let text = choice
+                    .delta
+                    .content
+                    .as_deref()
+                    .filter(|s| !s.is_empty())
+                    .or_else(|| {
+                        choice.delta.reasoning.as_deref().filter(|s| !s.is_empty())
+                    });
+                if let Some(t) = text {
+                    events.push(SseEvent::Content(t.to_owned()));
+                }
             }
             if let Some(u) = parsed.usage {
                 events.push(SseEvent::Usage(u));
