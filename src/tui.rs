@@ -4,8 +4,8 @@ use crate::config::RunConfig;
 use crate::error::ProbeError;
 use crate::fmt::thousands;
 use crate::metrics::{
-    aggregate, mean, ConfigSnapshot, ConversationOutcome, GrowResult, RunReport, TerminalReason,
-    TurnOutcome,
+    aggregate, mean, request_messages, ConfigSnapshot, ConversationOutcome, GrowResult, RunReport,
+    TerminalReason, TurnOutcome,
 };
 use crate::runner::{RunEvent, run_grow};
 use ratatui::Terminal;
@@ -39,6 +39,9 @@ const MAX_CONV_ROWS: usize = 500;
 /// Fixed size of the conversation-detail modal.
 const DETAIL_W: u16 = 102;
 const DETAIL_H: u16 = 34;
+/// Fixed size of the per-turn request/response modal (roomier for long replies).
+const TURN_W: u16 = 110;
+const TURN_H: u16 = 40;
 
 // ── Terminal guard ────────────────────────────────────────────────────────────
 
@@ -177,7 +180,14 @@ struct TuiState {
     selected: usize,
     sort: SortKey,
     show_detail: bool,
-    detail_scroll: u16,
+    /// Selected turn row inside the detail modal.
+    detail_turn: usize,
+    /// Request/response drill-down for the selected turn is open.
+    show_turn: bool,
+    /// Scroll offset inside the request/response view.
+    turn_scroll: u16,
+    /// false = last user message only, true = full request payload.
+    turn_expanded: bool,
     show_help: bool,
     paused: bool,
     /// Accumulated pause duration across all pause/resume cycles.
@@ -201,6 +211,7 @@ impl TuiState {
                 stream: cfg.stream,
                 max_tokens: cfg.max_tokens,
                 turn_prompt: cfg.turn_prompt.clone(),
+                seed_messages: cfg.seed_messages(),
             },
             total_conversations: cfg.conversations,
             partial_convs: BTreeMap::new(),
@@ -212,7 +223,10 @@ impl TuiState {
             selected: 0,
             sort: SortKey::Recent,
             show_detail: false,
-            detail_scroll: 0,
+            detail_turn: 0,
+            show_turn: false,
+            turn_scroll: 0,
+            turn_expanded: false,
             show_help: false,
             paused: false,
             paused_total: Duration::ZERO,
@@ -237,7 +251,10 @@ impl TuiState {
             selected: 0,
             sort: SortKey::Recent,
             show_detail: false,
-            detail_scroll: 0,
+            detail_turn: 0,
+            show_turn: false,
+            turn_scroll: 0,
+            turn_expanded: false,
             show_help: false,
             paused: false,
             paused_total: Duration::ZERO,
@@ -410,17 +427,141 @@ impl TuiState {
         rows
     }
 
-    /// Largest valid scroll offset for the detail modal of the selected
-    /// conversation, so navigation can't run past the end of the content.
-    fn detail_max_scroll(&self) -> u16 {
-        // Detail box is DETAIL_H tall; subtract the two border rows for the
-        // visible viewport. Content = 6 fixed header/summary lines + one line
-        // per turn (an upper bound, so the last line is always reachable).
-        const VIEWPORT: usize = DETAIL_H as usize - 2;
+    /// Number of turns in the currently selected conversation (clamps the
+    /// turn cursor inside the detail modal).
+    fn detail_turn_count(&self) -> usize {
         let rows = self.conv_rows();
         let selected = self.selected.min(rows.len().saturating_sub(1));
-        let lines = rows.get(selected).map_or(0, |r| 6 + r.turns.len());
-        lines.saturating_sub(VIEWPORT) as u16
+        rows.get(selected).map_or(0, |r| r.turns.len())
+    }
+
+    /// Styled body of the request/response view for the selected turn. Shared by
+    /// `draw_turn` (rendering) and `turn_max_scroll` (line counting) so the two
+    /// can never drift apart.
+    fn turn_lines(&self) -> Vec<Line<'static>> {
+        let rows = self.conv_rows();
+        let selected = self.selected.min(rows.len().saturating_sub(1));
+        let Some(row) = rows.get(selected) else {
+            return Vec::new();
+        };
+        let turn_idx = self.detail_turn.min(row.turns.len().saturating_sub(1));
+        let Some(turn) = row.turns.get(turn_idx) else {
+            return Vec::new();
+        };
+
+        let dim = Style::default().fg(Color::DarkGray);
+        let accent = Style::default().fg(ACCENT);
+        // Pads a label out to the modal's inner width with a box-drawing rule.
+        let divider = |label: String| -> Line<'static> {
+            const INNER: usize = TURN_W as usize - 3;
+            let fill = INNER.saturating_sub(label.chars().count());
+            Line::from(Span::styled(format!("{label}{}", "─".repeat(fill)), dim))
+        };
+        let body = |text: &str| -> Vec<Line<'static>> {
+            text.lines()
+                .map(|l| Line::from(Span::raw(format!("  {l}"))))
+                .collect()
+        };
+
+        let mut lines: Vec<Line<'static>> = Vec::new();
+
+        // Header: status + this turn's metrics.
+        let status = if turn.success {
+            Span::styled("✓ ok", Style::default().fg(Color::Green))
+        } else {
+            let label = turn.error.map_or("✗ error".to_string(), |e| format!("✗ {e}"));
+            Span::styled(label, Style::default().fg(Color::Red))
+        };
+        let mut meta = String::new();
+        if let Some(v) = turn.prompt_tokens {
+            meta.push_str(&format!("  prompt {} tok", thousands(u64::from(v))));
+        }
+        if let Some(v) = turn.completion_tokens {
+            meta.push_str(&format!(" · compl {} tok", thousands(u64::from(v))));
+        }
+        meta.push_str(&format!(" · e2e {:.2}s", turn.e2e.as_secs_f64()));
+        if let Some(d) = turn.ttft {
+            meta.push_str(&format!(" · ttft {:.0}ms", d.as_secs_f64() * 1000.0));
+        }
+        if let Some(v) = turn.tps {
+            meta.push_str(&format!(" · tps {v:.1}"));
+        }
+        lines.push(Line::from(vec![
+            Span::raw("  "),
+            status,
+            Span::styled(meta, dim),
+        ]));
+        lines.push(Line::from(""));
+
+        // REQUEST — last user message by default, full payload when expanded.
+        let msgs = request_messages(
+            row.turns,
+            turn_idx,
+            &self.cfg_snap.seed_messages,
+            &self.cfg_snap.turn_prompt,
+        );
+        if self.turn_expanded {
+            lines.push(divider(format!(
+                "  ── REQUEST ({} messages · x to collapse) ",
+                msgs.len()
+            )));
+            for (role, content) in &msgs {
+                lines.push(Line::from(Span::styled(format!("  [{role}]"), accent)));
+                lines.extend(body(content));
+            }
+        } else {
+            // Only advertise expansion when the full payload holds more than the
+            // single message already on screen.
+            let label = if msgs.len() > 1 {
+                format!(
+                    "  ── REQUEST (last of {} messages · x to expand) ",
+                    msgs.len()
+                )
+            } else {
+                "  ── REQUEST (user) ".to_string()
+            };
+            lines.push(divider(label));
+            let last = msgs.last().map(|(_, c)| c.as_str()).unwrap_or("");
+            if last.is_empty() {
+                lines.push(Line::from(Span::styled("  (empty)", dim)));
+            } else {
+                lines.extend(body(last));
+            }
+        }
+        lines.push(Line::from(""));
+
+        // RESPONSE — the captured reply, or the error for a failed turn.
+        lines.push(divider("  ── RESPONSE (assistant) ".into()));
+        if turn.success {
+            match turn.reply.as_deref() {
+                Some(r) if !r.is_empty() => lines.extend(body(r)),
+                _ => lines.push(Line::from(Span::styled("  (empty response)", dim))),
+            }
+        } else {
+            let label = turn
+                .error
+                .map_or("request failed".to_string(), |e| format!("request failed: {e}"));
+            lines.push(Line::from(Span::styled(
+                format!("  {label}"),
+                Style::default().fg(Color::Red),
+            )));
+        }
+
+        lines
+    }
+
+    /// Largest valid scroll offset for the request/response view, so navigation
+    /// can't run past the end of the content. Counts wrapped rows for the modal's
+    /// fixed inner width (an upper bound, so the last line stays reachable).
+    fn turn_max_scroll(&self) -> u16 {
+        const INNER: usize = TURN_W as usize - 3;
+        const VIEWPORT: usize = TURN_H as usize - 2;
+        let total: usize = self
+            .turn_lines()
+            .iter()
+            .map(|l| l.width().max(1).div_ceil(INNER))
+            .sum();
+        total.saturating_sub(VIEWPORT) as u16
     }
 }
 
@@ -545,17 +686,44 @@ fn handle_key(state: &mut TuiState, code: KeyCode, pause_tx: &watch::Sender<bool
         }
         return false;
     }
+    // Innermost view first: request/response for one turn.
+    if state.show_turn {
+        match code {
+            KeyCode::Esc | KeyCode::Char('q') => state.show_turn = false,
+            KeyCode::Up | KeyCode::Char('k') => {
+                state.turn_scroll = state.turn_scroll.saturating_sub(1);
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                state.turn_scroll = (state.turn_scroll + 1).min(state.turn_max_scroll());
+            }
+            KeyCode::Char('g') => state.turn_scroll = 0,
+            KeyCode::Char('G') => state.turn_scroll = state.turn_max_scroll(),
+            KeyCode::Char('x') => {
+                state.turn_expanded = !state.turn_expanded;
+                state.turn_scroll = 0;
+            }
+            _ => {}
+        }
+        return false;
+    }
+    // Detail modal: ↑/↓ select a turn, Enter drills into it.
     if state.show_detail {
+        let last = state.detail_turn_count().saturating_sub(1);
         match code {
             KeyCode::Esc | KeyCode::Char('q') => state.show_detail = false,
             KeyCode::Up | KeyCode::Char('k') => {
-                state.detail_scroll = state.detail_scroll.saturating_sub(1);
+                state.detail_turn = state.detail_turn.saturating_sub(1);
             }
             KeyCode::Down | KeyCode::Char('j') => {
-                state.detail_scroll = (state.detail_scroll + 1).min(state.detail_max_scroll());
+                state.detail_turn = (state.detail_turn + 1).min(last);
             }
-            KeyCode::Char('g') => state.detail_scroll = 0,
-            KeyCode::Char('G') => state.detail_scroll = state.detail_max_scroll(),
+            KeyCode::Char('g') => state.detail_turn = 0,
+            KeyCode::Char('G') => state.detail_turn = last,
+            KeyCode::Enter if state.detail_turn_count() > 0 => {
+                state.show_turn = true;
+                state.turn_scroll = 0;
+                state.turn_expanded = false;
+            }
             _ => {}
         }
         return false;
@@ -574,7 +742,7 @@ fn handle_key(state: &mut TuiState, code: KeyCode, pause_tx: &watch::Sender<bool
         KeyCode::Char('?') => state.show_help = true,
         KeyCode::Enter if row_count > 0 => {
             state.show_detail = true;
-            state.detail_scroll = 0;
+            state.detail_turn = 0;
         }
         KeyCode::Up | KeyCode::Char('k') => {
             state.selected = state.selected.saturating_sub(1);
@@ -612,6 +780,9 @@ fn draw(frame: &mut ratatui::Frame, state: &TuiState) {
 
     if state.show_detail {
         draw_detail(frame, state, &rows);
+    }
+    if state.show_turn {
+        draw_turn(frame, state, &rows);
     }
     if state.show_help {
         draw_help(frame);
@@ -935,17 +1106,34 @@ fn draw_detail(frame: &mut ratatui::Frame, state: &TuiState, rows: &[ConvRow]) {
         dim,
     )));
 
-    for t in row.turns {
+    // Fixed lead lines above the turn rows; turn `i` lands on line `lead + i`.
+    let lead = lines.len();
+    let sel_turn = state.detail_turn.min(row.turns.len().saturating_sub(1));
+    let highlight = Style::default()
+        .bg(Color::Indexed(238))
+        .add_modifier(Modifier::BOLD);
+
+    for (i, t) in row.turns.iter().enumerate() {
         let dash = "—";
+        let selected = i == sel_turn;
         let status_span = if t.success {
             Span::styled("✓ ok", Style::default().fg(Color::Green))
         } else {
             let label = t.error.map_or("✗ error".to_string(), |e| format!("✗ {e}"));
             Span::styled(label, Style::default().fg(Color::Red))
         };
-        lines.push(Line::from(vec![
+        // `▸` flags rows with content to open — a captured reply, or an error
+        // to inspect on a failed turn.
+        let openable = t.reply.as_deref().is_some_and(|r| !r.is_empty()) || !t.success;
+        let marker = if openable {
+            Span::styled("  ▸", dim)
+        } else {
+            Span::raw("")
+        };
+        let mut line = Line::from(vec![
             Span::raw(format!(
-                "  {:>4}  {:>10}  {:>10}  {:>7}  {:>7}  {:>8}  {:>7}  ",
+                "{} {:>4}  {:>10}  {:>10}  {:>7}  {:>7}  {:>8}  {:>7}  ",
+                if selected { "›" } else { " " },
                 t.turn_idx + 1,
                 t.prompt_tokens
                     .map_or(dash.to_string(), |v| thousands(u64::from(v))),
@@ -958,13 +1146,29 @@ fn draw_detail(frame: &mut ratatui::Frame, state: &TuiState, rows: &[ConvRow]) {
                 t.tps.map_or(dash.to_string(), |v| format!("{v:.1}")),
             )),
             status_span,
-        ]));
+            marker,
+        ]);
+        if selected {
+            line = line.style(highlight);
+        }
+        lines.push(line);
     }
     if row.turns.is_empty() {
         lines.push(Line::from(Span::styled("  (no turns recorded yet)", dim)));
     }
 
-    let title = format!(" conv #{} detail  ·  ↑/↓ scroll  ·  esc / q close ", row.conv_id);
+    // Keep the highlighted turn inside the viewport (header lines don't wrap at
+    // this width, so line index == row index).
+    let viewport = DETAIL_H.saturating_sub(2) as usize;
+    let sel_line = lead + sel_turn;
+    let scroll = sel_line.saturating_sub(viewport.saturating_sub(1)) as u16;
+
+    let hint = if row.turns.is_empty() {
+        "esc / q close".to_string()
+    } else {
+        "↑/↓ select · enter view · esc close".to_string()
+    };
+    let title = format!(" conv #{} detail  ·  {hint} ", row.conv_id);
     let para = Paragraph::new(lines)
         .block(
             Block::default()
@@ -977,7 +1181,44 @@ fn draw_detail(frame: &mut ratatui::Frame, state: &TuiState, rows: &[ConvRow]) {
                 .padding(Padding::new(0, 1, 0, 0)),
         )
         .wrap(Wrap { trim: false })
-        .scroll((state.detail_scroll, 0));
+        .scroll((scroll, 0));
+    frame.render_widget(para, area);
+}
+
+/// Request/response drill-down for the selected turn. Rendered on top of the
+/// detail modal; the body is built by `TuiState::turn_lines`.
+fn draw_turn(frame: &mut ratatui::Frame, state: &TuiState, rows: &[ConvRow]) {
+    let selected = state.selected.min(rows.len().saturating_sub(1));
+    let Some(row) = rows.get(selected) else {
+        return;
+    };
+    if row.turns.is_empty() {
+        return;
+    }
+    let turn_idx = state.detail_turn.min(row.turns.len() - 1);
+
+    let area = centered_fixed(frame.area(), TURN_W, TURN_H);
+    frame.render_widget(Clear, area);
+
+    let title = format!(
+        " conv #{} · turn {}/{}  ·  ↑/↓ scroll · x expand · esc back ",
+        row.conv_id,
+        turn_idx + 1,
+        row.turns.len()
+    );
+    let para = Paragraph::new(state.turn_lines())
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .title(Span::styled(
+                    title,
+                    Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                ))
+                .padding(Padding::new(0, 1, 0, 0)),
+        )
+        .wrap(Wrap { trim: false })
+        .scroll((state.turn_scroll, 0));
     frame.render_widget(para, area);
 }
 
@@ -1015,7 +1256,7 @@ fn draw_footer(frame: &mut ratatui::Frame, area: Rect, state: &TuiState) {
 }
 
 fn draw_help(frame: &mut ratatui::Frame) {
-    let area = centered_fixed(frame.area(), 72, 28);
+    let area = centered_fixed(frame.area(), 72, 30);
     frame.render_widget(Clear, area);
 
     let key = |k: &'static str, d: &'static str| {
@@ -1045,9 +1286,11 @@ fn draw_help(frame: &mut ratatui::Frame) {
 
     let lines = vec![
         section("KEYS"),
-        key("↑/↓  j/k", "navigate conversations (or scroll the detail view)"),
-        key("g  G", "jump to top / bottom of list or detail"),
-        key("enter", "open turn-detail for selected conversation"),
+        key("↑/↓  j/k", "navigate conversations / turns / scroll request view"),
+        key("g  G", "jump to top / bottom of the current list or view"),
+        key("enter", "drill in: conversation → turn list → request/response"),
+        key("x", "in request view: expand / collapse the full request payload"),
+        key("esc", "step back out one level"),
         key("s", "cycle sort: recent → turns → TTFT → TPS"),
         key("space / p", "pause / resume dispatch and freeze metrics"),
         key("?", "toggle this help overlay"),

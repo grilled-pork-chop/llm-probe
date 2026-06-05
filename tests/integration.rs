@@ -111,6 +111,19 @@ async fn context_limit_terminates_conversation() {
     assert_eq!(ok_count, 3, "3 successful turns before overflow");
     // The 4th turn (the overflow attempt) is recorded as failed
     assert_eq!(conv.turns.len(), 4, "3 ok + 1 failed overflow turn");
+
+    // The expected context-overflow turn must not count against the success
+    // rate: it is excluded from the denominator, so a clean grow run is 100%.
+    let report = aggregate(&result);
+    assert_eq!(report.turns.ok_turns, 3);
+    assert_eq!(
+        report.turns.total_turns, 3,
+        "overflow turn excluded from denominator"
+    );
+    assert!(
+        (report.turns.success_rate - 1.0).abs() < 0.001,
+        "100% success rate on a clean grow run"
+    );
 }
 
 // ── Test 2: conversation history grows each turn ──────────────────────────────

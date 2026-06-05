@@ -110,6 +110,7 @@ pub async fn run_grow(
             stream: cfg.stream,
             max_tokens: cfg.max_tokens,
             turn_prompt: cfg.turn_prompt.clone(),
+            seed_messages: cfg.seed_messages(),
         },
     })
 }
@@ -167,11 +168,7 @@ async fn run_conversation(
     let conv_start = Instant::now();
 
     // Build the initial message list from config seed.
-    let mut messages: Vec<(String, String)> = if cfg.messages.is_empty() {
-        vec![("user".into(), cfg.prompt.clone())]
-    } else {
-        cfg.messages.clone()
-    };
+    let mut messages: Vec<(String, String)> = cfg.seed_messages();
 
     let mut turns: Vec<TurnOutcome> = Vec::new();
 
