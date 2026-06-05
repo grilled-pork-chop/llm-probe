@@ -28,8 +28,6 @@ impl ErrorKind {
             Http(e) => {
                 if e.is_timeout() {
                     ErrorKind::Timeout
-                } else if e.is_connect() {
-                    ErrorKind::Connect
                 } else {
                     ErrorKind::Connect
                 }
@@ -70,7 +68,6 @@ pub struct TurnOutcome {
     pub tpot_ms: Option<f64>,
     /// Mean of observed inter-token wall-clock gaps (streaming only).
     pub itl_ms: Option<f64>,
-    pub max_gap_ms: Option<f64>,
     /// `completion_tokens / gen_time` in tokens/s.
     pub tps: Option<f64>,
     pub success: bool,
@@ -95,7 +92,6 @@ impl TurnOutcome {
             ttft: None,
             tpot_ms: None,
             itl_ms: None,
-            max_gap_ms: None,
             tps: None,
             success: false,
             error: Some(error),
@@ -497,7 +493,6 @@ mod tests {
             ttft: Some(Duration::from_millis(200)),
             tpot_ms: Some(tpot),
             itl_ms: None,
-            max_gap_ms: None,
             tps: Some(80.0),
             success: true,
             error: None,
