@@ -39,7 +39,7 @@ Builds with the live TUI by default. To build a smaller binary without it:
 cargo install --path . --no-default-features
 ```
 
-See [INSTALL.md](INSTALL.md) for pre-built binary installation and static musl builds.
+See [INSTALL.md](INSTALL.md) for installation, full option reference, and key bindings.
 
 ## Quick start
 
@@ -73,38 +73,6 @@ Each concurrent **slot** runs an independent conversation:
 
 Use `--seed` to fix the RNG and get identical prompt sequences across runs for
 fair A/B comparisons.
-
-## Options
-
-See [USAGE.md](USAGE.md) for the full option reference and examples.
-
-## Exit codes
-
-| Code | Meaning |
-|------|---------|
-| `0` | All conversations completed without errors. |
-| `2` | Some conversations ended with errors. |
-| `1` | All conversations errored, config error, or endpoint unreachable. |
-
-## Building & portability
-
-- TLS is **rustls** (no system OpenSSL) — cross-compiles cleanly everywhere.
-- Release profile is size-optimised (`lto`, `codegen-units = 1`, `strip`).
-
-### Fully static Linux binary (musl)
-
-```sh
-rustup target add x86_64-unknown-linux-musl
-cargo build --release --features tui --target x86_64-unknown-linux-musl
-```
-
-If your environment lacks `cmake` (needed by `aws-lc-rs` for musl), use
-[`cross`](https://github.com/cross-rs/cross):
-
-```sh
-cargo install cross
-cross build --release --features tui --target x86_64-unknown-linux-musl
-```
 
 ## License
 
