@@ -2,8 +2,6 @@
 
 use clap::Parser;
 
-
-
 #[derive(Debug, Parser)]
 #[command(
     name = "llmprobe",
@@ -35,7 +33,13 @@ pub struct Args {
     #[arg(long)]
     pub stream: bool,
 
-/// Stop a conversation after this many turns regardless of context limit (0 = unlimited).
+    /// System prompt sent as the first message of every conversation.
+    /// When omitted, a random system prompt from the built-in pool is used
+    /// per conversation to vary model verbosity and persona.
+    #[arg(short = 's', long)]
+    pub system: Option<String>,
+
+    /// Stop a conversation after this many turns regardless of context limit (0 = unlimited).
     #[arg(long = "max-turns", default_value_t = 0)]
     pub max_turns: usize,
 
@@ -58,11 +62,6 @@ pub struct Args {
     /// Extra header in 'Key: Value' form (repeatable).
     #[arg(short = 'H', long = "header")]
     pub headers: Vec<String>,
-
-    /// Seed conversation turn in 'role: content' form (repeatable, in order).
-    /// When given, overrides --prompt.
-    #[arg(short = 'M', long = "message")]
-    pub messages: Vec<String>,
 
     /// Live TUI dashboard (requires the `tui` feature).
     #[arg(long)]

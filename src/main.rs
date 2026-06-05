@@ -89,13 +89,13 @@ async fn main() -> ExitCode {
         args.conversations,
         args.concurrency,
         args.stream,
+        args.system,
         args.max_turns,
         args.max_tokens,
         args.temperature,
         args.timeout,
         args.api_key,
         &args.headers,
-        &args.messages,
     ) {
         Ok(c) => c,
         Err(e) => {

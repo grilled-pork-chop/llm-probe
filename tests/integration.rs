@@ -39,12 +39,12 @@ fn make_cfg(
         conversations,
         concurrency,
         stream,
+        None,
         max_turns,
         Some(64),
         None,
         10,
         None,
-        &[],
         &[],
     )
     .expect("valid test config")
@@ -169,14 +169,14 @@ async fn conversation_history_grows_each_turn() {
     run_grow(&cfg, None, None).await.expect("run completes");
 
     let counts = log.lock().await;
-    // Turn 0: [user:"hello"]                                       → 1 message
-    // Turn 1: [user, assistant, user:"Please continue."]           → 3 messages
-    // Turn 2: [user, asst, user, asst, user:"Please continue."]   → 5 messages
-    // Turn 3 (overflow): grows by 2 again                          → 7 messages
+    // Turn 0: [system, user(seed)]                                 → 2 messages
+    // Turn 1: [system, user, assistant, user(pool)]                → 4 messages
+    // Turn 2: [system, user, asst, user, asst, user(pool)]        → 6 messages
+    // Turn 3 (overflow): grows by 2 again                          → 8 messages
     assert_eq!(
         *counts,
-        vec![1, 3, 5, 7],
-        "messages array must grow by 2 each turn (one assistant + one user appended)"
+        vec![2, 4, 6, 8],
+        "messages array must grow by 2 each turn (one assistant + one pool user turn)"
     );
 }
 
@@ -198,12 +198,12 @@ async fn concurrent_slots_complete_independently() {
         4,
         2,
         false,
+        None,
         1,
         Some(64),
         None,
         10,
         None,
-        &[],
         &[],
     )
     .expect("cfg");

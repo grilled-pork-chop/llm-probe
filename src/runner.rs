@@ -110,7 +110,6 @@ pub async fn run_grow(
             concurrency: cfg.concurrency,
             stream: cfg.stream,
             max_tokens: cfg.max_tokens,
-            seed_messages: cfg.seed_messages(),
         },
     })
 }
@@ -169,11 +168,17 @@ async fn run_conversation(
 
     let mut sampler = PromptSampler::new();
 
-    // Seed: --message pairs when given, otherwise the pool template seed.
-    let mut messages: Vec<(String, String)> = if cfg.messages.is_empty() {
-        vec![("user".into(), sampler.seed().to_owned())]
-    } else {
-        cfg.seed_messages()
+    // System prompt: fixed override or random pool sample.
+    let system = cfg.system_prompt.as_deref().unwrap_or_else(|| sampler.system());
+
+    // Build initial messages: optional system turn + pool seed.
+    let mut messages: Vec<(String, String)> = {
+        let mut m = Vec::new();
+        if !system.is_empty() {
+            m.push(("system".into(), system.to_owned()));
+        }
+        m.push(("user".into(), sampler.seed().to_owned()));
+        m
     };
 
     let mut turns: Vec<TurnOutcome> = Vec::new();

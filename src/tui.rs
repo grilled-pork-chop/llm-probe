@@ -210,7 +210,6 @@ impl TuiState {
                 concurrency: cfg.concurrency,
                 stream: cfg.stream,
                 max_tokens: cfg.max_tokens,
-                seed_messages: cfg.seed_messages(),
             },
             total_conversations: cfg.conversations,
             partial_convs: BTreeMap::new(),
@@ -493,11 +492,7 @@ impl TuiState {
         lines.push(Line::from(""));
 
         // REQUEST — last user message by default, full payload when expanded.
-        let msgs = request_messages(
-            row.turns,
-            turn_idx,
-            &self.cfg_snap.seed_messages,
-        );
+        let msgs = request_messages(row.turns, turn_idx);
         if self.turn_expanded {
             lines.push(divider(format!(
                 "  ── REQUEST ({} messages · x to collapse) ",

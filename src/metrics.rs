@@ -177,12 +177,8 @@ impl ConversationOutcome {
 /// growth loop in `runner::run_conversation`, so no per-turn request payload is
 /// stored — the replies we already keep are sufficient. Takes a `turns` slice so
 /// both completed and in-flight (partial) conversations can be reconstructed.
-pub fn request_messages(
-    turns: &[TurnOutcome],
-    turn_idx: usize,
-    seed: &[(String, String)],
-) -> Vec<(String, String)> {
-    let mut msgs = seed.to_vec();
+pub fn request_messages(turns: &[TurnOutcome], turn_idx: usize) -> Vec<(String, String)> {
+    let mut msgs = vec![("user".into(), "(pool seed)".into())];
     for t in turns.iter().take(turn_idx) {
         msgs.push(("assistant".into(), t.reply.clone().unwrap_or_default()));
         msgs.push(("user".into(), "(pool prompt)".into()));
@@ -200,11 +196,6 @@ pub struct ConfigSnapshot {
     pub concurrency: usize,
     pub stream: bool,
     pub max_tokens: Option<u32>,
-    /// Initial conversation seed as `(role, content)` pairs. Used to reconstruct
-    /// each turn's request in the TUI. `#[serde(default)]` keeps `GrowResult`
-    /// JSON saved before this field was added loadable for replay.
-    #[serde(default)]
-    pub seed_messages: Vec<(String, String)>,
 }
 
 /// The complete output of a grow run.
@@ -542,7 +533,6 @@ mod tests {
                 concurrency: 1,
                 stream: true,
                 max_tokens: None,
-                seed_messages: vec![("user".into(), "Start.".into())],
             },
         };
         let report = aggregate(&result);
@@ -576,16 +566,17 @@ mod tests {
             terminal: TerminalReason::ContextLimit,
             wall_clock: Duration::from_secs(1),
         };
-        let seed = vec![("user".to_string(), "Start.".to_string())];
-
-        // Turn 0 sees only the seed.
-        assert_eq!(request_messages(&conv.turns, 0, &seed), seed);
+        // Turn 0 sees only the pool seed placeholder.
+        assert_eq!(
+            request_messages(&conv.turns, 0),
+            vec![("user".into(), "(pool seed)".into())]
+        );
 
         // Turn 2 sees seed + interleaved (assistant reply, pool prompt placeholder).
         assert_eq!(
-            request_messages(&conv.turns, 2, &seed),
+            request_messages(&conv.turns, 2),
             vec![
-                ("user".into(), "Start.".into()),
+                ("user".into(), "(pool seed)".into()),
                 ("assistant".into(), "reply-0".into()),
                 ("user".into(), "(pool prompt)".into()),
                 ("assistant".into(), "reply-1".into()),
