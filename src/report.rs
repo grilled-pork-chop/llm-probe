@@ -37,10 +37,9 @@ pub fn render(result: &GrowResult, color: bool) -> String {
         cfg.model
     ));
     push(&mut out, format!(
-        "mode: {mode} · slots: {} · max-tokens: {} · turn: \"{}\"",
+        "mode: {mode} · slots: {} · max-tokens: {} · turn: (pool)",
         cfg.concurrency,
         cfg.max_tokens.map_or("unlimited".into(), |n| n.to_string()),
-        cfg.turn_prompt.as_deref().unwrap_or("(pool)")
     ));
     out.push('\n');
 
@@ -183,18 +182,17 @@ fn push(out: &mut String, line: String) {
 struct JsonReport<'a> {
     target: &'a str,
     model: &'a str,
-    config: JsonConfig<'a>,
+    config: JsonConfig,
     conversations: JsonConvStats,
     turns: JsonTurnStats,
     degradation: Vec<JsonDegBucket>,
 }
 
 #[derive(Serialize)]
-struct JsonConfig<'a> {
+struct JsonConfig {
     concurrency: usize,
     stream: bool,
     max_tokens: Option<u32>,
-    turn_prompt: Option<&'a str>,
 }
 
 #[derive(Serialize)]
@@ -239,7 +237,6 @@ pub fn render_json(result: &GrowResult) -> Result<String, serde_json::Error> {
             concurrency: cfg.concurrency,
             stream: cfg.stream,
             max_tokens: cfg.max_tokens,
-            turn_prompt: cfg.turn_prompt.as_deref(),
         },
         conversations: JsonConvStats {
             total: report.conversations.total,

@@ -181,13 +181,11 @@ pub fn request_messages(
     turns: &[TurnOutcome],
     turn_idx: usize,
     seed: &[(String, String)],
-    turn_prompt: Option<&str>,
 ) -> Vec<(String, String)> {
-    let fallback = turn_prompt.unwrap_or("(pool prompt — exact text not stored)");
     let mut msgs = seed.to_vec();
     for t in turns.iter().take(turn_idx) {
         msgs.push(("assistant".into(), t.reply.clone().unwrap_or_default()));
-        msgs.push(("user".into(), fallback.into()));
+        msgs.push(("user".into(), "(pool prompt)".into()));
     }
     msgs
 }
@@ -202,7 +200,6 @@ pub struct ConfigSnapshot {
     pub concurrency: usize,
     pub stream: bool,
     pub max_tokens: Option<u32>,
-    pub turn_prompt: Option<String>,
     /// Initial conversation seed as `(role, content)` pairs. Used to reconstruct
     /// each turn's request in the TUI. `#[serde(default)]` keeps `GrowResult`
     /// JSON saved before this field was added loadable for replay.
@@ -545,7 +542,6 @@ mod tests {
                 concurrency: 1,
                 stream: true,
                 max_tokens: None,
-                turn_prompt: None,
                 seed_messages: vec![("user".into(), "Start.".into())],
             },
         };

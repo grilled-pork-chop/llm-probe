@@ -18,9 +18,6 @@ pub struct RunConfig {
     pub stream: bool,
     /// Seed user message (used when `messages` is empty).
     pub prompt: String,
-    /// User message appended as the follow-up turn each grow step.
-    /// `None` means use the built-in ShareGPT prompt pool (random each turn).
-    pub turn_prompt: Option<String>,
     /// Per-conversation turn cap; `0` = unlimited.
     pub max_turns_per_conv: usize,
     /// Initial conversation seed as `(role, content)` pairs.
@@ -53,7 +50,6 @@ impl RunConfig {
         concurrency: usize,
         stream: bool,
         prompt: String,
-        turn_prompt: Option<String>,
         max_turns_per_conv: usize,
         max_tokens: Option<u32>,
         temperature: Option<f32>,
@@ -71,7 +67,7 @@ impl RunConfig {
         if matches!(max_tokens, Some(0)) {
             return Err(ProbeError::Config("max-tokens must be >= 1 when set".into()));
         }
-let endpoint = resolve_endpoint(url)?;
+        let endpoint = resolve_endpoint(url)?;
         let headers = parse_kv("header", ':', raw_headers)?;
         let messages = parse_kv("message", ':', raw_messages)?;
         Ok(Self {
@@ -81,7 +77,6 @@ let endpoint = resolve_endpoint(url)?;
             concurrency,
             stream,
             prompt,
-            turn_prompt,
             max_turns_per_conv,
             messages,
             max_tokens,
@@ -178,8 +173,7 @@ mod tests {
     fn build_accepts_valid_config() {
         let cfg = RunConfig::build(
             "http://x", "m".into(), 0, 1, false,
-            "p".into(), "Please continue.".into(), 0,
-            1, None, 1, None, &[], &[],
+            "p".into(), 0, None, None, 1, None, &[], &[],
         );
         assert!(cfg.is_ok());
     }
@@ -188,12 +182,12 @@ mod tests {
     fn build_rejects_bad_values() {
         assert!(RunConfig::build(
             "http://x", "m".into(), 0, 0, false,
-            "p".into(), "c".into(), 0, 1, None, 1, None, &[], &[],
+            "p".into(), 0, None, None, 1, None, &[], &[],
         ).is_err()); // concurrency=0
 
         assert!(RunConfig::build(
             "http://x", "m".into(), 0, 1, false,
-            "p".into(), "c".into(), 0, 1, None, 0, None, &[], &[],
+            "p".into(), 0, None, None, 0, None, &[], &[],
         ).is_err()); // timeout=0
     }
 }

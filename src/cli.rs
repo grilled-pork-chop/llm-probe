@@ -41,12 +41,6 @@ pub struct Args {
     #[arg(short, long, default_value = DEFAULT_PROMPT)]
     pub prompt: String,
 
-    /// User message appended every grow step.
-    /// When omitted, a random prompt from the built-in ShareGPT pool is used
-    /// each turn for realistic, cache-busting traffic.
-    #[arg(long)]
-    pub turn: Option<String>,
-
     /// Stop a conversation after this many turns regardless of context limit (0 = unlimited).
     #[arg(long = "max-turns", default_value_t = 0)]
     pub max_turns: usize,

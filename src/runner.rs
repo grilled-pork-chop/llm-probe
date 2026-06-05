@@ -110,7 +110,6 @@ pub async fn run_grow(
             concurrency: cfg.concurrency,
             stream: cfg.stream,
             max_tokens: cfg.max_tokens,
-            turn_prompt: cfg.turn_prompt.clone(),
             seed_messages: cfg.seed_messages(),
         },
     })
@@ -168,7 +167,7 @@ async fn run_conversation(
 ) -> ConversationOutcome {
     let conv_start = Instant::now();
 
-    let mut sampler = cfg.turn_prompt.is_none().then(PromptSampler::new);
+    let mut sampler = PromptSampler::new();
 
     // Build the initial message list from config seed.
     let mut messages: Vec<(String, String)> = cfg.seed_messages();
@@ -221,11 +220,7 @@ async fn run_conversation(
         // Append assistant reply and follow-up user turn to grow the conversation.
         let assistant_text = reply.unwrap_or_default();
         messages.push(("assistant".into(), assistant_text));
-        let next_turn = match &cfg.turn_prompt {
-            Some(fixed) => fixed.clone(),
-            None => sampler.as_mut().unwrap().next().to_owned(),
-        };
-        messages.push(("user".into(), next_turn));
+        messages.push(("user".into(), sampler.next().to_owned()));
     };
 
     ConversationOutcome {

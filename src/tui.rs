@@ -210,7 +210,6 @@ impl TuiState {
                 concurrency: cfg.concurrency,
                 stream: cfg.stream,
                 max_tokens: cfg.max_tokens,
-                turn_prompt: cfg.turn_prompt.clone(),
                 seed_messages: cfg.seed_messages(),
             },
             total_conversations: cfg.conversations,
@@ -498,7 +497,6 @@ impl TuiState {
             row.turns,
             turn_idx,
             &self.cfg_snap.seed_messages,
-            self.cfg_snap.turn_prompt.as_deref(),
         );
         if self.turn_expanded {
             lines.push(divider(format!(

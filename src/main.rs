@@ -90,7 +90,6 @@ async fn main() -> ExitCode {
         args.concurrency,
         args.stream,
         args.prompt,
-        args.turn,
         args.max_turns,
         args.max_tokens,
         args.temperature,
