@@ -19,7 +19,8 @@ pub struct RunConfig {
     /// Seed user message (used when `messages` is empty).
     pub prompt: String,
     /// User message appended as the follow-up turn each grow step.
-    pub turn_prompt: String,
+    /// `None` means use the built-in ShareGPT prompt pool (random each turn).
+    pub turn_prompt: Option<String>,
     /// Per-conversation turn cap; `0` = unlimited.
     pub max_turns_per_conv: usize,
     /// Initial conversation seed as `(role, content)` pairs.
@@ -52,7 +53,7 @@ impl RunConfig {
         concurrency: usize,
         stream: bool,
         prompt: String,
-        turn_prompt: String,
+        turn_prompt: Option<String>,
         max_turns_per_conv: usize,
         max_tokens: Option<u32>,
         temperature: Option<f32>,

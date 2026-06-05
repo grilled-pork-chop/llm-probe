@@ -9,6 +9,7 @@
 
 use crate::client::{build_client, send_turn};
 use crate::config::RunConfig;
+use crate::prompts::PromptSampler;
 use crate::error::ProbeError;
 use crate::metrics::{ConfigSnapshot, ConversationOutcome, GrowResult, TerminalReason, TurnOutcome};
 use std::sync::Arc;
@@ -167,6 +168,8 @@ async fn run_conversation(
 ) -> ConversationOutcome {
     let conv_start = Instant::now();
 
+    let mut sampler = cfg.turn_prompt.is_none().then(PromptSampler::new);
+
     // Build the initial message list from config seed.
     let mut messages: Vec<(String, String)> = cfg.seed_messages();
 
@@ -218,7 +221,11 @@ async fn run_conversation(
         // Append assistant reply and follow-up user turn to grow the conversation.
         let assistant_text = reply.unwrap_or_default();
         messages.push(("assistant".into(), assistant_text));
-        messages.push(("user".into(), cfg.turn_prompt.clone()));
+        let next_turn = match &cfg.turn_prompt {
+            Some(fixed) => fixed.clone(),
+            None => sampler.as_mut().unwrap().next().to_owned(),
+        };
+        messages.push(("user".into(), next_turn));
     };
 
     ConversationOutcome {

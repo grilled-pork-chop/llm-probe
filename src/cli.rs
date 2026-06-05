@@ -5,8 +5,6 @@ use clap::Parser;
 /// Default first user message when no -M flags are given.
 pub const DEFAULT_PROMPT: &str = "Write three sentences about the history of computing.";
 
-/// Default follow-up message appended every turn to grow the conversation.
-pub const DEFAULT_TURN: &str = "Please continue.";
 
 #[derive(Debug, Parser)]
 #[command(
@@ -43,9 +41,11 @@ pub struct Args {
     #[arg(short, long, default_value = DEFAULT_PROMPT)]
     pub prompt: String,
 
-    /// User message appended every grow step. Defaults to "Please continue."
-    #[arg(long, default_value = DEFAULT_TURN)]
-    pub turn: String,
+    /// User message appended every grow step.
+    /// When omitted, a random prompt from the built-in ShareGPT pool is used
+    /// each turn for realistic, cache-busting traffic.
+    #[arg(long)]
+    pub turn: Option<String>,
 
     /// Stop a conversation after this many turns regardless of context limit (0 = unlimited).
     #[arg(long = "max-turns", default_value_t = 0)]

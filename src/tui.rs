@@ -498,7 +498,7 @@ impl TuiState {
             row.turns,
             turn_idx,
             &self.cfg_snap.seed_messages,
-            &self.cfg_snap.turn_prompt,
+            self.cfg_snap.turn_prompt.as_deref(),
         );
         if self.turn_expanded {
             lines.push(divider(format!(
