@@ -22,9 +22,13 @@ pub struct PromptSampler {
 }
 
 impl PromptSampler {
-    /// Create a sampler with a random template and random system prompt.
-    pub fn new() -> Self {
-        let mut rng = SmallRng::from_os_rng();
+    /// Create a sampler. When `seed` is `Some`, the RNG is deterministic so
+    /// the same prompt sequence is produced across runs for fair comparison.
+    pub fn new(seed: Option<u64>) -> Self {
+        let mut rng = match seed {
+            Some(s) => SmallRng::seed_from_u64(s),
+            None => SmallRng::from_os_rng(),
+        };
         let template = TEMPLATES.choose(&mut rng).unwrap();
         let system = SYSTEM_PROMPTS.choose(&mut rng).copied().unwrap_or("");
         Self { rng, template, system, last: None }

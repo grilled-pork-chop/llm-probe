@@ -166,7 +166,7 @@ async fn run_conversation(
 ) -> ConversationOutcome {
     let conv_start = Instant::now();
 
-    let mut sampler = PromptSampler::new();
+    let mut sampler = PromptSampler::new(cfg.rng_seed);
 
     // System prompt: fixed override or random pool sample.
     let system = cfg.system_prompt.as_deref().unwrap_or_else(|| sampler.system());

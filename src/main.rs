@@ -16,7 +16,6 @@ async fn main() -> ExitCode {
 
     let json = args.json;
     let color = !json
-        && !args.no_color
         && std::env::var_os("NO_COLOR").is_none()
         && std::io::stdout().is_terminal();
 
@@ -92,7 +91,7 @@ async fn main() -> ExitCode {
         args.system,
         args.max_turns,
         args.max_tokens,
-        args.temperature,
+        args.seed,
         args.timeout,
         args.api_key,
         &args.headers,

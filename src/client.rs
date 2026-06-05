@@ -66,7 +66,6 @@ async fn send(
         messages: msg_refs,
         stream: cfg.stream,
         max_tokens: cfg.max_tokens,
-        temperature: cfg.temperature,
         stream_options: cfg.stream.then_some(StreamOptions { include_usage: true }),
     };
 

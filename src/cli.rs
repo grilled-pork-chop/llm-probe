@@ -47,9 +47,10 @@ pub struct Args {
     #[arg(long)]
     pub max_tokens: Option<u32>,
 
-    /// Sampling temperature (omitted from the request when unset).
+    /// RNG seed for reproducible prompt selection across runs.
+    /// When omitted, a random seed is used each run.
     #[arg(long)]
-    pub temperature: Option<f32>,
+    pub seed: Option<u64>,
 
     /// Per-turn request timeout in seconds.
     #[arg(long, default_value_t = 60)]
@@ -70,10 +71,6 @@ pub struct Args {
     /// Machine-readable JSON report.
     #[arg(long)]
     pub json: bool,
-
-    /// Disable ANSI colour.
-    #[arg(long)]
-    pub no_color: bool,
 
     /// Write the completed run to FILE as JSON (can be reopened with --replay).
     #[arg(long)]

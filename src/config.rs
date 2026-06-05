@@ -21,7 +21,8 @@ pub struct RunConfig {
     /// Per-conversation turn cap; `0` = unlimited.
     pub max_turns_per_conv: usize,
     pub max_tokens: Option<u32>,
-    pub temperature: Option<f32>,
+    /// RNG seed for reproducible prompt selection. `None` = random each run.
+    pub rng_seed: Option<u64>,
     pub timeout: Duration,
     pub api_key: Option<String>,
     pub headers: Vec<(String, String)>,
@@ -38,7 +39,7 @@ impl RunConfig {
         system_prompt: Option<String>,
         max_turns_per_conv: usize,
         max_tokens: Option<u32>,
-        temperature: Option<f32>,
+        rng_seed: Option<u64>,
         timeout_secs: u64,
         api_key: Option<String>,
         raw_headers: &[String],
@@ -63,7 +64,7 @@ impl RunConfig {
             system_prompt,
             max_turns_per_conv,
             max_tokens,
-            temperature,
+            rng_seed,
             timeout: Duration::from_secs(timeout_secs),
             api_key,
             headers,
