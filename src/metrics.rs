@@ -579,17 +579,17 @@ mod tests {
         let seed = vec![("user".to_string(), "Start.".to_string())];
 
         // Turn 0 sees only the seed.
-        assert_eq!(request_messages(&conv.turns, 0, &seed, "Continue."), seed);
+        assert_eq!(request_messages(&conv.turns, 0, &seed), seed);
 
-        // Turn 2 sees seed + interleaved (assistant reply, user turn-prompt).
+        // Turn 2 sees seed + interleaved (assistant reply, pool prompt placeholder).
         assert_eq!(
-            request_messages(&conv.turns, 2, &seed, "Continue."),
+            request_messages(&conv.turns, 2, &seed),
             vec![
                 ("user".into(), "Start.".into()),
                 ("assistant".into(), "reply-0".into()),
-                ("user".into(), "Continue.".into()),
+                ("user".into(), "(pool prompt)".into()),
                 ("assistant".into(), "reply-1".into()),
-                ("user".into(), "Continue.".into()),
+                ("user".into(), "(pool prompt)".into()),
             ]
         );
     }

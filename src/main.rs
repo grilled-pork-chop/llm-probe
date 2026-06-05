@@ -1,7 +1,7 @@
 //! `llmprobe` binary entry point.
 
 use clap::Parser;
-use llmprobe::cli::{Args, DEFAULT_PROMPT};
+use llmprobe::cli::Args;
 use llmprobe::config::RunConfig;
 use llmprobe::metrics::aggregate;
 use llmprobe::persist;
@@ -89,8 +89,6 @@ async fn main() -> ExitCode {
         args.conversations,
         args.concurrency,
         args.stream,
-        args.prompt.as_deref().unwrap_or(DEFAULT_PROMPT).into(),
-        args.prompt.is_none(),
         args.max_turns,
         args.max_tokens,
         args.temperature,

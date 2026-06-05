@@ -2,7 +2,6 @@
 
 use clap::Parser;
 
-pub const DEFAULT_PROMPT: &str = "Write three sentences about the history of computing.";
 
 
 #[derive(Debug, Parser)]
@@ -36,14 +35,7 @@ pub struct Args {
     #[arg(long)]
     pub stream: bool,
 
-    /// Seed message for every conversation.
-    /// When omitted, each conversation starts with the seed from the built-in
-    /// prompt pool (varies per conversation). Provide this to fix a specific
-    /// starting topic for all conversations.
-    #[arg(short, long)]
-    pub prompt: Option<String>,
-
-    /// Stop a conversation after this many turns regardless of context limit (0 = unlimited).
+/// Stop a conversation after this many turns regardless of context limit (0 = unlimited).
     #[arg(long = "max-turns", default_value_t = 0)]
     pub max_turns: usize,
 
