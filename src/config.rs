@@ -25,7 +25,7 @@ pub struct RunConfig {
     /// Initial conversation seed as `(role, content)` pairs.
     /// Non-empty when `--message` flags were given; overrides `prompt`.
     pub messages: Vec<(String, String)>,
-    pub max_tokens: u32,
+    pub max_tokens: Option<u32>,
     pub temperature: Option<f32>,
     pub timeout: Duration,
     pub api_key: Option<String>,
@@ -54,7 +54,7 @@ impl RunConfig {
         prompt: String,
         turn_prompt: String,
         max_turns_per_conv: usize,
-        max_tokens: u32,
+        max_tokens: Option<u32>,
         temperature: Option<f32>,
         timeout_secs: u64,
         api_key: Option<String>,
@@ -67,10 +67,10 @@ impl RunConfig {
         if timeout_secs == 0 {
             return Err(ProbeError::Config("timeout must be > 0".into()));
         }
-        if max_tokens < 1 {
-            return Err(ProbeError::Config("max-tokens must be >= 1".into()));
+        if matches!(max_tokens, Some(0)) {
+            return Err(ProbeError::Config("max-tokens must be >= 1 when set".into()));
         }
-        let endpoint = resolve_endpoint(url)?;
+let endpoint = resolve_endpoint(url)?;
         let headers = parse_kv("header", ':', raw_headers)?;
         let messages = parse_kv("message", ':', raw_messages)?;
         Ok(Self {

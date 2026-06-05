@@ -38,7 +38,9 @@ pub fn render(result: &GrowResult, color: bool) -> String {
     ));
     push(&mut out, format!(
         "mode: {mode} · slots: {} · max-tokens: {} · turn: \"{}\"",
-        cfg.concurrency, cfg.max_tokens, cfg.turn_prompt
+        cfg.concurrency,
+        cfg.max_tokens.map_or("unlimited".into(), |n| n.to_string()),
+        cfg.turn_prompt
     ));
     out.push('\n');
 
@@ -191,7 +193,7 @@ struct JsonReport<'a> {
 struct JsonConfig<'a> {
     concurrency: usize,
     stream: bool,
-    max_tokens: u32,
+    max_tokens: Option<u32>,
     turn_prompt: &'a str,
 }
 

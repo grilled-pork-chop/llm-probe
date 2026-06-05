@@ -13,16 +13,6 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc::UnboundedSender;
 
 const ERR_BODY_LIMIT: usize = 512;
-const BODY_LIMIT: usize = 65536;
-
-fn cap_body(s: String) -> String {
-    if s.chars().count() <= BODY_LIMIT {
-        return s;
-    }
-    let mut out: String = s.chars().take(BODY_LIMIT).collect();
-    out.push_str("\n… (truncated)");
-    out
-}
 
 pub fn build_client(cfg: &RunConfig) -> Result<Client, ProbeError> {
     Client::builder()
@@ -75,7 +65,7 @@ async fn send(
         model: &cfg.model,
         messages: msg_refs,
         stream: cfg.stream,
-        max_tokens: Some(cfg.max_tokens),
+        max_tokens: cfg.max_tokens,
         temperature: cfg.temperature,
         stream_options: cfg.stream.then_some(StreamOptions { include_usage: true }),
     };
@@ -133,8 +123,7 @@ async fn non_streaming(
             let m = c.message;
             m.content.filter(|s| !s.is_empty()).or(m.reasoning)
         })
-        .filter(|s| !s.is_empty())
-        .map(cap_body);
+        .filter(|s| !s.is_empty());
     Ok(TurnOutcome {
         conv_id,
         turn_idx,
@@ -224,9 +213,7 @@ async fn stream_response(
         for event in decoder.feed(&chunk?)? {
             match event {
                 SseEvent::Content(text) => {
-                    if reply.len() < BODY_LIMIT {
-                        reply.push_str(&text);
-                    }
+                    reply.push_str(&text);
                     let now = Instant::now();
                     if t_first.is_none() {
                         t_first = Some(now);
@@ -277,7 +264,7 @@ async fn stream_response(
         (Some(c), Some(g)) if c > 1 => Some(g.as_secs_f64() * 1000.0 / f64::from(c - 1)),
         _ => None,
     };
-    let reply = (!reply.is_empty()).then(|| cap_body(reply));
+    let reply = (!reply.is_empty()).then_some(reply);
 
     Ok(TurnOutcome {
         conv_id,

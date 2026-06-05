@@ -200,7 +200,7 @@ pub struct ConfigSnapshot {
     pub model: String,
     pub concurrency: usize,
     pub stream: bool,
-    pub max_tokens: u32,
+    pub max_tokens: Option<u32>,
     pub turn_prompt: String,
     /// Initial conversation seed as `(role, content)` pairs. Used to reconstruct
     /// each turn's request in the TUI. `#[serde(default)]` keeps `GrowResult`
@@ -543,7 +543,7 @@ mod tests {
                 model: "m".into(),
                 concurrency: 1,
                 stream: true,
-                max_tokens: 128,
+                max_tokens: None,
                 turn_prompt: "Continue.".into(),
                 seed_messages: vec![("user".into(), "Start.".into())],
             },
