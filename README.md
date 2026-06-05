@@ -12,8 +12,9 @@ exercises prefill, decode, KV-cache reuse, and memory pressure at scale.
 llmprobe -u http://localhost:8000 -m my-model --stream -c 4
 ```
 
-The live TUI (default) shows TTFT, TPOT, and TPS metrics updating in real time
-with per-conversation and per-turn drill-down.
+The live TUI (default) shows TTFT, TPOT, and TPS metrics updating in real time,
+with a running list of conversations. A full text or JSON report is printed when
+the run ends.
 
 ## Key metrics
 
@@ -29,17 +30,16 @@ with per-conversation and per-turn drill-down.
 
 ## Install
 
-```sh
-cargo install --path .
-```
-
-Builds with the live TUI by default. To build a smaller binary without it:
+Download a prebuilt static Linux x86_64 binary from the
+[Releases](../../releases) page, or build from source:
 
 ```sh
-cargo install --path . --no-default-features
+cargo install --path .                       # with the live TUI (default)
+cargo install --path . --no-default-features # smaller binary, no TUI
 ```
 
-See [INSTALL.md](INSTALL.md) for installation, full option reference, and key bindings.
+See [INSTALL.md](INSTALL.md) for the packaged-binary instructions and full option
+reference.
 
 ## Quick start
 
@@ -47,24 +47,19 @@ See [INSTALL.md](INSTALL.md) for installation, full option reference, and key bi
 # Live dashboard — grows conversations until context limit, runs forever
 llmprobe -u http://localhost:8000 -m llama-3.1-8b --stream -c 4
 
-# Fixed run: 10 conversations, 2 concurrent slots, save result
-llmprobe -u http://localhost:8000 -m llama-3.1-8b -n 10 -c 2 --stream \
-         --output run.json
-
-# Replay a saved run interactively (no HTTP requests made)
-llmprobe --replay run.json
+# Fixed run: 10 conversations, 2 concurrent slots
+llmprobe -u http://localhost:8000 -m llama-3.1-8b -n 10 -c 2 --stream
 
 # Machine-readable report
-llmprobe -u "$ENDPOINT" -m my-model -n 20 --stream --json --no-tui
+llmprobe -u "$ENDPOINT" -m my-model -n 20 --stream --json
 ```
 
 ## How it works
 
 Each concurrent **slot** runs an independent conversation:
-1. A random system prompt and seed message are drawn from the built-in
-   ShareGPT-derived prompt pool.
-2. The conversation grows one user turn at a time, alternating with the model's
-   reply.
+1. A system prompt and seed message are drawn from a small built-in prompt set.
+2. The conversation grows one user turn at a time — the model's reply plus a
+   follow-up nudge — so each turn sends a longer, unique context.
 3. When the server returns a context-overflow error (HTTP 400/413 with a
    recognised message), the conversation is recorded as `ctx-limit` and a new
    one starts.
@@ -74,6 +69,18 @@ Each concurrent **slot** runs an independent conversation:
 Use `--seed` to fix the RNG and get identical prompt sequences across runs for
 fair A/B comparisons.
 
+## Development
+
+```sh
+cargo fmt --all --check
+cargo clippy --all-targets -- -D warnings
+cargo test
+```
+
+CI runs the same checks on every push and pull request. Tagging a release
+(`git tag v0.1.0 && git push --tags`) builds and publishes the static Linux
+binary — the tag must match the `Cargo.toml` version.
+
 ## License
 
-MIT
+MIT — see [LICENSE](LICENSE).

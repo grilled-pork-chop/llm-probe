@@ -9,17 +9,17 @@ use clap::Parser;
     long_about = "Runs C concurrent conversation slots (-c), each growing a conversation \
 turn-by-turn until the server refuses with a context-length error. \
 Collect TTFT, TPOT, TPS, and context-window stats per turn, per conversation, \
-and in aggregate. Save runs with --output and replay them interactively with --replay.",
+and in aggregate, shown live in a compact dashboard (or --no-tui / --json).",
     version
 )]
 pub struct Args {
     /// Base or full endpoint. Appends /v1/chat/completions if absent.
-    #[arg(short, long, required_unless_present = "replay")]
-    pub url: Option<String>,
+    #[arg(short, long)]
+    pub url: String,
 
     /// Model name.
-    #[arg(short, long, required_unless_present = "replay")]
-    pub model: Option<String>,
+    #[arg(short, long)]
+    pub model: String,
 
     /// Total conversations to complete across all slots; 0 = run forever.
     #[arg(short = 'n', long = "conversations", default_value_t = 0)]
@@ -71,12 +71,4 @@ pub struct Args {
     /// Machine-readable JSON report.
     #[arg(long)]
     pub json: bool,
-
-    /// Write the completed run to FILE as JSON (can be reopened with --replay).
-    #[arg(long)]
-    pub output: Option<String>,
-
-    /// Load a saved run from FILE and open the interactive view (no HTTP requests made).
-    #[arg(long, conflicts_with_all = ["url", "model"])]
-    pub replay: Option<String>,
 }

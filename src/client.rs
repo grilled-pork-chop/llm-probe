@@ -38,13 +38,22 @@ pub async fn send_turn(
         let _ = tx.send(RunEvent::TurnStarted { conv_id, turn_idx });
     }
     let t0 = Instant::now();
-    match send(client, cfg, conv_id, turn_idx, messages, tx, t0).await {
+    let mut outcome = match send(client, cfg, conv_id, turn_idx, messages, tx, t0).await {
         Ok(outcome) => outcome,
         Err(err) => {
             let kind = ErrorKind::from_probe(&err);
             TurnOutcome::failed(conv_id, turn_idx, t0.elapsed(), kind)
         }
-    }
+    };
+    // Record this turn's prompt (the last user message) so the report can show
+    // real text. Centralised here to cover both success and failure.
+    outcome.prompt = messages
+        .iter()
+        .rev()
+        .find(|(role, _)| role == "user")
+        .map(|(_, content)| content.clone())
+        .unwrap_or_default();
+    outcome
 }
 
 async fn send(
@@ -137,6 +146,7 @@ async fn non_streaming(
         tps,
         success: true,
         error: None,
+        prompt: String::new(),
         reply,
     })
 }
@@ -275,6 +285,7 @@ async fn stream_response(
         tps,
         success: true,
         error: None,
+        prompt: String::new(),
         reply,
     })
 }
@@ -369,6 +380,20 @@ mod tests {
         let mut d = SseDecoder::default();
         let err = d.feed(b"data: {not json}\n").unwrap_err();
         assert!(matches!(err, ProbeError::Stream(_)));
+    }
+
+    #[test]
+    fn uses_reasoning_when_content_absent_or_empty() {
+        // GLM-style models sometimes emit text only in `reasoning`. Both an
+        // absent and an empty `content` must fall back to it so the reply is
+        // captured and the conversation keeps growing.
+        let mut d = SseDecoder::default();
+        let input = concat!(
+            "data: {\"choices\":[{\"delta\":{\"reasoning\":\"think\"}}]}\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"\",\"reasoning\":\"more\"}}]}\n",
+        );
+        let events = d.feed(input.as_bytes()).unwrap();
+        assert_eq!(contents(&events), vec!["think", "more"]);
     }
 
     #[test]

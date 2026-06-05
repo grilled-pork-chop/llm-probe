@@ -4,7 +4,6 @@ use clap::Parser;
 use llmprobe::cli::Args;
 use llmprobe::config::RunConfig;
 use llmprobe::metrics::aggregate;
-use llmprobe::persist;
 use llmprobe::report;
 use llmprobe::runner::run_grow;
 use std::io::IsTerminal;
@@ -17,72 +16,9 @@ async fn main() -> ExitCode {
     let json = args.json;
     let color = !json && std::env::var_os("NO_COLOR").is_none() && std::io::stdout().is_terminal();
 
-    // ── Replay mode: load file and display without running anything ──────────
-    if let Some(ref path) = args.replay {
-        let result = match persist::load(path) {
-            Ok(r) => r,
-            Err(e) => {
-                eprintln!("error: {e}");
-                return ExitCode::from(1);
-            }
-        };
-
-        #[cfg(feature = "tui")]
-        if !args.no_tui {
-            match llmprobe::tui::replay(&result).await {
-                Ok(()) => {}
-                Err(e) => {
-                    eprintln!("error: {e}");
-                    return ExitCode::from(1);
-                }
-            }
-            if json {
-                match report::render_json(&result) {
-                    Ok(s) => println!("{s}"),
-                    Err(e) => {
-                        eprintln!("error: {e}");
-                        return ExitCode::from(1);
-                    }
-                }
-            } else {
-                print!("{}", report::render(&result, color));
-            }
-            return ExitCode::from(0);
-        }
-
-        if json {
-            match report::render_json(&result) {
-                Ok(s) => println!("{s}"),
-                Err(e) => {
-                    eprintln!("error: {e}");
-                    return ExitCode::from(1);
-                }
-            }
-        } else {
-            print!("{}", report::render(&result, color));
-        }
-        return ExitCode::from(0);
-    }
-
-    // ── Live run ─────────────────────────────────────────────────────────────
-    let url = match &args.url {
-        Some(u) => u.as_str(),
-        None => {
-            eprintln!("error: --url is required unless --replay is given");
-            return ExitCode::from(1);
-        }
-    };
-    let model = match args.model {
-        Some(m) => m,
-        None => {
-            eprintln!("error: --model is required unless --replay is given");
-            return ExitCode::from(1);
-        }
-    };
-
     let cfg = match RunConfig::build(
-        url,
-        model,
+        &args.url,
+        args.model,
         args.conversations,
         args.concurrency,
         args.stream,
@@ -101,7 +37,7 @@ async fn main() -> ExitCode {
         }
     };
 
-    let use_tui = !args.no_tui && cfg!(feature = "tui");
+    let use_tui = !args.no_tui && !json && cfg!(feature = "tui");
 
     let result = if use_tui {
         #[cfg(feature = "tui")]
@@ -116,7 +52,7 @@ async fn main() -> ExitCode {
         }
         #[cfg(not(feature = "tui"))]
         {
-            unreachable!("--tui rejected above")
+            unreachable!("tui disabled at compile time")
         }
     } else {
         match run_grow(&cfg, None, None).await {
@@ -127,13 +63,6 @@ async fn main() -> ExitCode {
             }
         }
     };
-
-    // Optional save.
-    if let Some(ref path) = args.output
-        && let Err(e) = persist::save(path, &result)
-    {
-        eprintln!("warning: could not save output: {e}");
-    }
 
     let summary = aggregate(&result);
 

@@ -75,6 +75,11 @@ pub struct TurnOutcome {
     pub tps: Option<f64>,
     pub success: bool,
     pub error: Option<ErrorKind>,
+    /// The user prompt sent this turn (pool seed on turn 0, follow-up after).
+    /// Stored so the report can show real text rather than placeholders.
+    /// `#[serde(default)]` tolerates JSON records without this field.
+    #[serde(default)]
+    pub prompt: String,
     /// Captured assistant reply text, used to grow conversation history.
     pub reply: Option<String>,
 }
@@ -93,6 +98,7 @@ impl TurnOutcome {
             tps: None,
             success: false,
             error: Some(error),
+            prompt: String::new(),
             reply: None,
         }
     }
@@ -123,6 +129,10 @@ impl fmt::Display for TerminalReason {
 pub struct ConversationOutcome {
     pub id: usize,
     pub slot: usize,
+    /// System prompt used for this conversation (override or pool pick).
+    /// `#[serde(default)]` tolerates JSON records without this field.
+    #[serde(default)]
+    pub system: String,
     pub turns: Vec<TurnOutcome>,
     pub terminal: TerminalReason,
     pub wall_clock: Duration,
@@ -170,23 +180,25 @@ impl ConversationOutcome {
     }
 }
 
-/// Full message list sent to the API at `turn_idx`, reconstructed from the seed,
-/// the constant turn-prompt, and each prior turn's captured reply. Mirrors the
-/// growth loop in `runner::run_conversation`, so no per-turn request payload is
-/// stored — the replies we already keep are sufficient. Takes a `turns` slice so
-/// both completed and in-flight (partial) conversations can be reconstructed.
+/// Full message list sent to the API at `turn_idx`, reconstructed by interleaving
+/// each turn's stored prompt with its captured reply. Mirrors the growth loop in
+/// `runner::run_conversation`. Takes a `turns` slice so both completed and
+/// in-flight (partial) conversations can be reconstructed.
 pub fn request_messages(turns: &[TurnOutcome], turn_idx: usize) -> Vec<(String, String)> {
-    let mut msgs = vec![("user".into(), "(pool seed)".into())];
+    let mut msgs = Vec::new();
     for t in turns.iter().take(turn_idx) {
+        msgs.push(("user".into(), t.prompt.clone()));
         msgs.push(("assistant".into(), t.reply.clone().unwrap_or_default()));
-        msgs.push(("user".into(), "(pool prompt)".into()));
+    }
+    if let Some(t) = turns.get(turn_idx) {
+        msgs.push(("user".into(), t.prompt.clone()));
     }
     msgs
 }
 
 // ── Run-level result ──────────────────────────────────────────────────────────
 
-/// Snapshot of `RunConfig` fields needed for replay display.
+/// Snapshot of `RunConfig` fields needed for report display.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConfigSnapshot {
     pub endpoint: String,
@@ -513,11 +525,13 @@ mod tests {
             tps: Some(80.0),
             success: true,
             error: None,
+            prompt: "prompt".into(),
             reply: Some("text".into()),
         };
         let conv = ConversationOutcome {
             id: 0,
             slot: 0,
+            system: "system".into(),
             turns: (0..8).map(|i| make_turn(0, i, 10.0 + i as f64)).collect(),
             terminal: TerminalReason::ContextLimit,
             wall_clock: Duration::from_secs(10),
@@ -543,7 +557,7 @@ mod tests {
 
     #[test]
     fn request_messages_reconstructs_history() {
-        let turn = |idx: usize, reply: &str| TurnOutcome {
+        let turn = |idx: usize, prompt: &str, reply: &str| TurnOutcome {
             conv_id: 0,
             turn_idx: idx,
             prompt_tokens: Some(10),
@@ -555,30 +569,33 @@ mod tests {
             tps: None,
             success: true,
             error: None,
+            prompt: prompt.into(),
             reply: Some(reply.into()),
         };
         let conv = ConversationOutcome {
             id: 0,
             slot: 0,
-            turns: vec![turn(0, "reply-0"), turn(1, "reply-1")],
+            system: "system".into(),
+            turns: vec![
+                turn(0, "seed-prompt", "reply-0"),
+                turn(1, "followup-prompt", "reply-1"),
+            ],
             terminal: TerminalReason::ContextLimit,
             wall_clock: Duration::from_secs(1),
         };
-        // Turn 0 sees only the pool seed placeholder.
+        // Turn 0 sees only its own (seed) prompt.
         assert_eq!(
             request_messages(&conv.turns, 0),
-            vec![("user".into(), "(pool seed)".into())]
+            vec![("user".into(), "seed-prompt".into())]
         );
 
-        // Turn 2 sees seed + interleaved (assistant reply, pool prompt placeholder).
+        // Turn 1 sees the seed, its reply, and this turn's follow-up prompt.
         assert_eq!(
-            request_messages(&conv.turns, 2),
+            request_messages(&conv.turns, 1),
             vec![
-                ("user".into(), "(pool seed)".into()),
+                ("user".into(), "seed-prompt".into()),
                 ("assistant".into(), "reply-0".into()),
-                ("user".into(), "(pool prompt)".into()),
-                ("assistant".into(), "reply-1".into()),
-                ("user".into(), "(pool prompt)".into()),
+                ("user".into(), "followup-prompt".into()),
             ]
         );
     }

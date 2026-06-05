@@ -26,6 +26,8 @@ pub enum RunEvent {
     ConvStarted {
         conv_id: usize,
         slot: usize,
+        /// System prompt for this conversation (override or pool pick).
+        system: String,
     },
     TurnStarted {
         conv_id: usize,
@@ -149,10 +151,8 @@ async fn slot_loop(slot: usize, ctx: SlotCtx<'_>) {
             break;
         }
 
-        if let Some(tx) = ctx.tx {
-            let _ = tx.send(RunEvent::ConvStarted { conv_id, slot });
-        }
-
+        // `ConvStarted` is emitted from inside `run_conversation`, once the
+        // system prompt for this conversation has been determined.
         let conv = run_conversation(slot, conv_id, ctx.client, ctx.cfg, ctx.tx, ctx.pause).await;
 
         if let Some(tx) = ctx.tx {
@@ -184,6 +184,16 @@ async fn run_conversation(
         .system_prompt
         .as_deref()
         .unwrap_or_else(|| sampler.system());
+
+    // Announce the conversation now that its system prompt is known, so the
+    // live TUI can show it. Still precedes the first `TurnStarted`.
+    if let Some(tx) = tx {
+        let _ = tx.send(RunEvent::ConvStarted {
+            conv_id,
+            slot,
+            system: system.to_owned(),
+        });
+    }
 
     // Build initial messages: optional system turn + pool seed.
     let mut messages: Vec<(String, String)> = {
@@ -249,6 +259,7 @@ async fn run_conversation(
     ConversationOutcome {
         id: conv_id,
         slot,
+        system: system.to_owned(),
         turns,
         terminal,
         wall_clock: conv_start.elapsed(),

@@ -36,11 +36,13 @@ static:
 	$(CARGO) build --release --target $(TARGET)
 
 ## package: build the static binary and bundle it with the docs into a .tar.gz
-package: static INSTALL.md USAGE.md
+package: static INSTALL.md README.md LICENSE
 	@rm -rf $(PKGDIR)
 	@mkdir -p $(PKGDIR)
 	cp $(BIN) $(PKGDIR)/$(NAME)
-	cp INSTALL.md USAGE.md $(PKGDIR)/
+	cp INSTALL.md $(PKGDIR)/
+	cp README.md $(PKGDIR)/
+	cp LICENSE $(PKGDIR)/
 	tar -czf $(TARBALL) -C $(DIST) $(PKGNAME)
 	@rm -rf $(PKGDIR)
 	@echo "==> packaged $(TARBALL)"
