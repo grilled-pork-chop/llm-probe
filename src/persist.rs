@@ -5,8 +5,7 @@ use crate::metrics::GrowResult;
 use std::path::Path;
 
 pub fn save(path: &str, result: &GrowResult) -> Result<(), ProbeError> {
-    let json = serde_json::to_string_pretty(result)
-        .map_err(ProbeError::Decode)?;
+    let json = serde_json::to_string_pretty(result).map_err(ProbeError::Decode)?;
     std::fs::write(Path::new(path), json)
         .map_err(|e| ProbeError::Stream(format!("failed to write {path}: {e}")))?;
     Ok(())

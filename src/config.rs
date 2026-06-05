@@ -16,34 +16,19 @@ pub struct RunConfig {
     /// Number of concurrent conversation slots.
     pub concurrency: usize,
     pub stream: bool,
-    /// Seed user message (used when `messages` is empty).
-    pub prompt: String,
-    /// User message appended as the follow-up turn each grow step.
-    pub turn_prompt: String,
+    /// Fixed system prompt override. `None` means sample from the built-in pool.
+    pub system_prompt: Option<String>,
     /// Per-conversation turn cap; `0` = unlimited.
     pub max_turns_per_conv: usize,
-    /// Initial conversation seed as `(role, content)` pairs.
-    /// Non-empty when `--message` flags were given; overrides `prompt`.
-    pub messages: Vec<(String, String)>,
-    pub max_tokens: u32,
-    pub temperature: Option<f32>,
+    pub max_tokens: Option<u32>,
+    /// RNG seed for reproducible prompt selection. `None` = random each run.
+    pub rng_seed: Option<u64>,
     pub timeout: Duration,
     pub api_key: Option<String>,
     pub headers: Vec<(String, String)>,
 }
 
 impl RunConfig {
-    /// Resolved initial conversation seed: the explicit `--message` pairs when
-    /// given, otherwise the single `--prompt` user turn. Single source of truth
-    /// for both the runner's growth loop and the replay/TUI request view.
-    pub fn seed_messages(&self) -> Vec<(String, String)> {
-        if self.messages.is_empty() {
-            vec![("user".into(), self.prompt.clone())]
-        } else {
-            self.messages.clone()
-        }
-    }
-
     #[allow(clippy::too_many_arguments)]
     pub fn build(
         url: &str,
@@ -51,15 +36,13 @@ impl RunConfig {
         conversations: usize,
         concurrency: usize,
         stream: bool,
-        prompt: String,
-        turn_prompt: String,
+        system_prompt: Option<String>,
         max_turns_per_conv: usize,
-        max_tokens: u32,
-        temperature: Option<f32>,
+        max_tokens: Option<u32>,
+        rng_seed: Option<u64>,
         timeout_secs: u64,
         api_key: Option<String>,
         raw_headers: &[String],
-        raw_messages: &[String],
     ) -> Result<Self, ProbeError> {
         if concurrency < 1 {
             return Err(ProbeError::Config("concurrency must be >= 1".into()));
@@ -67,24 +50,23 @@ impl RunConfig {
         if timeout_secs == 0 {
             return Err(ProbeError::Config("timeout must be > 0".into()));
         }
-        if max_tokens < 1 {
-            return Err(ProbeError::Config("max-tokens must be >= 1".into()));
+        if matches!(max_tokens, Some(0)) {
+            return Err(ProbeError::Config(
+                "max-tokens must be >= 1 when set".into(),
+            ));
         }
         let endpoint = resolve_endpoint(url)?;
         let headers = parse_kv("header", ':', raw_headers)?;
-        let messages = parse_kv("message", ':', raw_messages)?;
         Ok(Self {
             endpoint,
             model,
             conversations,
             concurrency,
             stream,
-            prompt,
-            turn_prompt,
+            system_prompt,
             max_turns_per_conv,
-            messages,
             max_tokens,
-            temperature,
+            rng_seed,
             timeout: Duration::from_secs(timeout_secs),
             api_key,
             headers,
@@ -118,9 +100,7 @@ fn parse_kv(kind: &str, sep: char, raw: &[String]) -> Result<Vec<(String, String
     raw.iter()
         .map(|s| {
             let (k, v) = s.split_once(sep).ok_or_else(|| {
-                ProbeError::Config(format!(
-                    "{kind} must be in 'key{sep} value' form: {s}"
-                ))
+                ProbeError::Config(format!("{kind} must be in 'key{sep} value' form: {s}"))
             })?;
             Ok((k.trim().to_string(), v.trim().to_string()))
         })
@@ -175,24 +155,61 @@ mod tests {
 
     #[test]
     fn build_accepts_valid_config() {
-        let cfg = RunConfig::build(
-            "http://x", "m".into(), 0, 1, false,
-            "p".into(), "Please continue.".into(), 0,
-            1, None, 1, None, &[], &[],
+        assert!(
+            RunConfig::build(
+                "http://x",
+                "m".into(),
+                0,
+                1,
+                false,
+                None,
+                0,
+                None,
+                None,
+                1,
+                None,
+                &[],
+            )
+            .is_ok()
         );
-        assert!(cfg.is_ok());
     }
 
     #[test]
     fn build_rejects_bad_values() {
-        assert!(RunConfig::build(
-            "http://x", "m".into(), 0, 0, false,
-            "p".into(), "c".into(), 0, 1, None, 1, None, &[], &[],
-        ).is_err()); // concurrency=0
+        assert!(
+            RunConfig::build(
+                "http://x",
+                "m".into(),
+                0,
+                0,
+                false,
+                None,
+                0,
+                None,
+                None,
+                1,
+                None,
+                &[],
+            )
+            .is_err()
+        ); // concurrency=0
 
-        assert!(RunConfig::build(
-            "http://x", "m".into(), 0, 1, false,
-            "p".into(), "c".into(), 0, 1, None, 0, None, &[], &[],
-        ).is_err()); // timeout=0
+        assert!(
+            RunConfig::build(
+                "http://x",
+                "m".into(),
+                0,
+                1,
+                false,
+                None,
+                0,
+                None,
+                None,
+                0,
+                None,
+                &[],
+            )
+            .is_err()
+        ); // timeout=0
     }
 }

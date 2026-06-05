@@ -14,6 +14,8 @@ pub enum ErrorKind {
     Connect,
     Decode,
     Stream,
+    /// Invalid configuration detected before any HTTP request was made.
+    Config,
 }
 
 impl ErrorKind {
@@ -32,7 +34,7 @@ impl ErrorKind {
                     ErrorKind::Connect
                 }
             }
-            Config(_) => ErrorKind::Connect,
+            Config(_) => ErrorKind::Config,
         }
     }
 }
@@ -46,6 +48,7 @@ impl fmt::Display for ErrorKind {
             ErrorKind::Connect => f.write_str("connect"),
             ErrorKind::Decode => f.write_str("decode"),
             ErrorKind::Stream => f.write_str("stream"),
+            ErrorKind::Config => f.write_str("config"),
         }
     }
 }
@@ -77,12 +80,7 @@ pub struct TurnOutcome {
 }
 
 impl TurnOutcome {
-    pub fn failed(
-        conv_id: usize,
-        turn_idx: usize,
-        e2e: Duration,
-        error: ErrorKind,
-    ) -> Self {
+    pub fn failed(conv_id: usize, turn_idx: usize, e2e: Duration, error: ErrorKind) -> Self {
         Self {
             conv_id,
             turn_idx,
@@ -177,16 +175,11 @@ impl ConversationOutcome {
 /// growth loop in `runner::run_conversation`, so no per-turn request payload is
 /// stored — the replies we already keep are sufficient. Takes a `turns` slice so
 /// both completed and in-flight (partial) conversations can be reconstructed.
-pub fn request_messages(
-    turns: &[TurnOutcome],
-    turn_idx: usize,
-    seed: &[(String, String)],
-    turn_prompt: &str,
-) -> Vec<(String, String)> {
-    let mut msgs = seed.to_vec();
+pub fn request_messages(turns: &[TurnOutcome], turn_idx: usize) -> Vec<(String, String)> {
+    let mut msgs = vec![("user".into(), "(pool seed)".into())];
     for t in turns.iter().take(turn_idx) {
         msgs.push(("assistant".into(), t.reply.clone().unwrap_or_default()));
-        msgs.push(("user".into(), turn_prompt.into()));
+        msgs.push(("user".into(), "(pool prompt)".into()));
     }
     msgs
 }
@@ -200,13 +193,7 @@ pub struct ConfigSnapshot {
     pub model: String,
     pub concurrency: usize,
     pub stream: bool,
-    pub max_tokens: u32,
-    pub turn_prompt: String,
-    /// Initial conversation seed as `(role, content)` pairs. Used to reconstruct
-    /// each turn's request in the TUI. `#[serde(default)]` keeps `GrowResult`
-    /// JSON saved before this field was added loadable for replay.
-    #[serde(default)]
-    pub seed_messages: Vec<(String, String)>,
+    pub max_tokens: Option<u32>,
 }
 
 /// The complete output of a grow run.
@@ -543,9 +530,7 @@ mod tests {
                 model: "m".into(),
                 concurrency: 1,
                 stream: true,
-                max_tokens: 128,
-                turn_prompt: "Continue.".into(),
-                seed_messages: vec![("user".into(), "Start.".into())],
+                max_tokens: None,
             },
         };
         let report = aggregate(&result);
@@ -579,20 +564,21 @@ mod tests {
             terminal: TerminalReason::ContextLimit,
             wall_clock: Duration::from_secs(1),
         };
-        let seed = vec![("user".to_string(), "Start.".to_string())];
-
-        // Turn 0 sees only the seed.
-        assert_eq!(request_messages(&conv.turns, 0, &seed, "Continue."), seed);
-
-        // Turn 2 sees seed + interleaved (assistant reply, user turn-prompt).
+        // Turn 0 sees only the pool seed placeholder.
         assert_eq!(
-            request_messages(&conv.turns, 2, &seed, "Continue."),
+            request_messages(&conv.turns, 0),
+            vec![("user".into(), "(pool seed)".into())]
+        );
+
+        // Turn 2 sees seed + interleaved (assistant reply, pool prompt placeholder).
+        assert_eq!(
+            request_messages(&conv.turns, 2),
             vec![
-                ("user".into(), "Start.".into()),
+                ("user".into(), "(pool seed)".into()),
                 ("assistant".into(), "reply-0".into()),
-                ("user".into(), "Continue.".into()),
+                ("user".into(), "(pool prompt)".into()),
                 ("assistant".into(), "reply-1".into()),
-                ("user".into(), "Continue.".into()),
+                ("user".into(), "(pool prompt)".into()),
             ]
         );
     }

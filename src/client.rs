@@ -13,16 +13,6 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc::UnboundedSender;
 
 const ERR_BODY_LIMIT: usize = 512;
-const BODY_LIMIT: usize = 8192;
-
-fn cap_body(s: String) -> String {
-    if s.chars().count() <= BODY_LIMIT {
-        return s;
-    }
-    let mut out: String = s.chars().take(BODY_LIMIT).collect();
-    out.push_str("\n… (truncated)");
-    out
-}
 
 pub fn build_client(cfg: &RunConfig) -> Result<Client, ProbeError> {
     Client::builder()
@@ -75,9 +65,10 @@ async fn send(
         model: &cfg.model,
         messages: msg_refs,
         stream: cfg.stream,
-        max_tokens: Some(cfg.max_tokens),
-        temperature: cfg.temperature,
-        stream_options: cfg.stream.then_some(StreamOptions { include_usage: true }),
+        max_tokens: cfg.max_tokens,
+        stream_options: cfg.stream.then_some(StreamOptions {
+            include_usage: true,
+        }),
     };
 
     let mut req = client.post(&cfg.endpoint).json(&body);
@@ -133,8 +124,7 @@ async fn non_streaming(
             let m = c.message;
             m.content.filter(|s| !s.is_empty()).or(m.reasoning)
         })
-        .filter(|s| !s.is_empty())
-        .map(cap_body);
+        .filter(|s| !s.is_empty());
     Ok(TurnOutcome {
         conv_id,
         turn_idx,
@@ -191,9 +181,7 @@ impl SseDecoder {
                     .content
                     .as_deref()
                     .filter(|s| !s.is_empty())
-                    .or_else(|| {
-                        choice.delta.reasoning.as_deref().filter(|s| !s.is_empty())
-                    });
+                    .or_else(|| choice.delta.reasoning.as_deref().filter(|s| !s.is_empty()));
                 if let Some(t) = text {
                     events.push(SseEvent::Content(t.to_owned()));
                 }
@@ -224,9 +212,7 @@ async fn stream_response(
         for event in decoder.feed(&chunk?)? {
             match event {
                 SseEvent::Content(text) => {
-                    if reply.len() < BODY_LIMIT {
-                        reply.push_str(&text);
-                    }
+                    reply.push_str(&text);
                     let now = Instant::now();
                     if t_first.is_none() {
                         t_first = Some(now);
@@ -251,9 +237,7 @@ async fn stream_response(
     let gen_time = match (t_first, t_last) {
         (Some(f), Some(l)) if l > f => Some(l.saturating_duration_since(f)),
         // Single-chunk: fall back to e2e − TTFT as the decode window.
-        (Some(_), Some(_)) => ttft
-            .map(|t| e2e.saturating_sub(t))
-            .filter(|d| !d.is_zero()),
+        (Some(_), Some(_)) => ttft.map(|t| e2e.saturating_sub(t)).filter(|d| !d.is_zero()),
         _ => None,
     };
     let gen_secs = gen_time.map(|d| d.as_secs_f64()).filter(|s| *s > 0.0);
@@ -277,7 +261,7 @@ async fn stream_response(
         (Some(c), Some(g)) if c > 1 => Some(g.as_secs_f64() * 1000.0 / f64::from(c - 1)),
         _ => None,
     };
-    let reply = (!reply.is_empty()).then(|| cap_body(reply));
+    let reply = (!reply.is_empty()).then_some(reply);
 
     Ok(TurnOutcome {
         conv_id,
@@ -358,7 +342,11 @@ mod tests {
     #[test]
     fn reassembles_payload_split_across_reads() {
         let mut d = SseDecoder::default();
-        assert!(d.feed(b"data: {\"choices\":[{\"delta\":{\"con").unwrap().is_empty());
+        assert!(
+            d.feed(b"data: {\"choices\":[{\"delta\":{\"con")
+                .unwrap()
+                .is_empty()
+        );
         assert!(d.feed(b"tent\":\"split\"}}]}").unwrap().is_empty());
         let events = d.feed(b"\n").unwrap();
         assert_eq!(contents(&events), vec!["split"]);

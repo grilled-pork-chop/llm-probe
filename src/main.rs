@@ -15,10 +15,7 @@ async fn main() -> ExitCode {
     let args = Args::parse();
 
     let json = args.json;
-    let color = !json
-        && !args.no_color
-        && std::env::var_os("NO_COLOR").is_none()
-        && std::io::stdout().is_terminal();
+    let color = !json && std::env::var_os("NO_COLOR").is_none() && std::io::stdout().is_terminal();
 
     // ── Replay mode: load file and display without running anything ──────────
     if let Some(ref path) = args.replay {
@@ -31,7 +28,7 @@ async fn main() -> ExitCode {
         };
 
         #[cfg(feature = "tui")]
-        if args.tui {
+        if !args.no_tui {
             match llmprobe::tui::replay(&result).await {
                 Ok(()) => {}
                 Err(e) => {
@@ -89,15 +86,13 @@ async fn main() -> ExitCode {
         args.conversations,
         args.concurrency,
         args.stream,
-        args.prompt,
-        args.turn,
+        args.system,
         args.max_turns,
         args.max_tokens,
-        args.temperature,
+        args.seed,
         args.timeout,
         args.api_key,
         &args.headers,
-        &args.messages,
     ) {
         Ok(c) => c,
         Err(e) => {
@@ -106,13 +101,9 @@ async fn main() -> ExitCode {
         }
     };
 
-    #[cfg(not(feature = "tui"))]
-    if args.tui {
-        eprintln!("error: this build has no TUI support; rebuild with --features tui");
-        return ExitCode::from(1);
-    }
+    let use_tui = !args.no_tui && cfg!(feature = "tui");
 
-    let result = if args.tui {
+    let result = if use_tui {
         #[cfg(feature = "tui")]
         {
             match llmprobe::tui::run(&cfg).await {
@@ -138,10 +129,10 @@ async fn main() -> ExitCode {
     };
 
     // Optional save.
-    if let Some(ref path) = args.output {
-        if let Err(e) = persist::save(path, &result) {
-            eprintln!("warning: could not save output: {e}");
-        }
+    if let Some(ref path) = args.output
+        && let Err(e) = persist::save(path, &result)
+    {
+        eprintln!("warning: could not save output: {e}");
     }
 
     let summary = aggregate(&result);

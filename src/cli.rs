@@ -2,12 +2,6 @@
 
 use clap::Parser;
 
-/// Default first user message when no -M flags are given.
-pub const DEFAULT_PROMPT: &str = "Write three sentences about the history of computing.";
-
-/// Default follow-up message appended every turn to grow the conversation.
-pub const DEFAULT_TURN: &str = "Please continue.";
-
 #[derive(Debug, Parser)]
 #[command(
     name = "llmprobe",
@@ -39,25 +33,24 @@ pub struct Args {
     #[arg(long)]
     pub stream: bool,
 
-    /// Initial user message (seed for every conversation).
-    #[arg(short, long, default_value = DEFAULT_PROMPT)]
-    pub prompt: String,
-
-    /// User message appended every grow step. Defaults to "Please continue."
-    #[arg(long, default_value = DEFAULT_TURN)]
-    pub turn: String,
+    /// System prompt sent as the first message of every conversation.
+    /// When omitted, a random system prompt from the built-in pool is used
+    /// per conversation to vary model verbosity and persona.
+    #[arg(short = 's', long)]
+    pub system: Option<String>,
 
     /// Stop a conversation after this many turns regardless of context limit (0 = unlimited).
     #[arg(long = "max-turns", default_value_t = 0)]
     pub max_turns: usize,
 
-    /// Cap output tokens per turn.
-    #[arg(long, default_value_t = 128)]
-    pub max_tokens: u32,
-
-    /// Sampling temperature (omitted from the request when unset).
+    /// Cap output tokens per turn (omitted when unset — server decides).
     #[arg(long)]
-    pub temperature: Option<f32>,
+    pub max_tokens: Option<u32>,
+
+    /// RNG seed for reproducible prompt selection across runs.
+    /// When omitted, a random seed is used each run.
+    #[arg(long)]
+    pub seed: Option<u64>,
 
     /// Per-turn request timeout in seconds.
     #[arg(long, default_value_t = 60)]
@@ -71,22 +64,13 @@ pub struct Args {
     #[arg(short = 'H', long = "header")]
     pub headers: Vec<String>,
 
-    /// Seed conversation turn in 'role: content' form (repeatable, in order).
-    /// When given, overrides --prompt.
-    #[arg(short = 'M', long = "message")]
-    pub messages: Vec<String>,
-
-    /// Live TUI dashboard (requires the `tui` feature).
+    /// Disable the live TUI dashboard and print a plain-text report instead.
     #[arg(long)]
-    pub tui: bool,
+    pub no_tui: bool,
 
     /// Machine-readable JSON report.
     #[arg(long)]
     pub json: bool,
-
-    /// Disable ANSI colour.
-    #[arg(long)]
-    pub no_color: bool,
 
     /// Write the completed run to FILE as JSON (can be reopened with --replay).
     #[arg(long)]

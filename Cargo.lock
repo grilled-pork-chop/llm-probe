@@ -1281,6 +1281,7 @@ dependencies = [
  "axum",
  "clap",
  "futures-util",
+ "rand 0.9.4",
  "ratatui",
  "reqwest",
  "serde",

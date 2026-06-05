@@ -4,8 +4,8 @@ use crate::config::RunConfig;
 use crate::error::ProbeError;
 use crate::fmt::thousands;
 use crate::metrics::{
-    aggregate, mean, request_messages, ConfigSnapshot, ConversationOutcome, GrowResult, RunReport,
-    TerminalReason, TurnOutcome,
+    ConfigSnapshot, ConversationOutcome, GrowResult, RunReport, TerminalReason, TurnOutcome,
+    aggregate, mean, request_messages,
 };
 use crate::runner::{RunEvent, run_grow};
 use ratatui::Terminal;
@@ -117,7 +117,10 @@ fn build_row(
         avg_ttft_ms: mean(&ttft),
         avg_tps: mean(&tps),
         total_prompt_tokens: ok().filter_map(|t| t.prompt_tokens).map(u64::from).sum(),
-        total_completion_tokens: ok().filter_map(|t| t.completion_tokens).map(u64::from).sum(),
+        total_completion_tokens: ok()
+            .filter_map(|t| t.completion_tokens)
+            .map(u64::from)
+            .sum(),
         terminal,
         turns,
     }
@@ -210,8 +213,6 @@ impl TuiState {
                 concurrency: cfg.concurrency,
                 stream: cfg.stream,
                 max_tokens: cfg.max_tokens,
-                turn_prompt: cfg.turn_prompt.clone(),
-                seed_messages: cfg.seed_messages(),
             },
             total_conversations: cfg.conversations,
             partial_convs: BTreeMap::new(),
@@ -290,8 +291,7 @@ impl TuiState {
         if let Some(done) = self.final_elapsed {
             return done;
         }
-        let paused = self.paused_total
-            + self.pause_start.map(|t| t.elapsed()).unwrap_or_default();
+        let paused = self.paused_total + self.pause_start.map(|t| t.elapsed()).unwrap_or_default();
         self.start.elapsed().saturating_sub(paused)
     }
 
@@ -312,11 +312,17 @@ impl TuiState {
             RunEvent::ConvStarted { conv_id, slot } => {
                 self.partial_convs.insert(
                     conv_id,
-                    PartialConv { conv_id, slot, turns: Vec::new() },
+                    PartialConv {
+                        conv_id,
+                        slot,
+                        turns: Vec::new(),
+                    },
                 );
             }
             RunEvent::TurnStarted { .. } | RunEvent::TurnFirstToken { .. } => {}
-            RunEvent::TurnFinished { conv_id, outcome, .. } => {
+            RunEvent::TurnFinished {
+                conv_id, outcome, ..
+            } => {
                 if let Some(p) = self.partial_convs.get_mut(&conv_id) {
                     p.turns.push(outcome);
                 }
@@ -375,15 +381,15 @@ impl TuiState {
         }
         self.last_report = Instant::now();
         self.recompute_report();
-        if !self.done {
-            if let Some(ref r) = self.report {
-                push_capped(
-                    &mut self.tps_hist,
-                    r.turns.aggregate_tps.unwrap_or(0.0).round() as u64,
-                );
-                let ttft_ms = r.turns.ttft.map(|t| t.avg.round() as u64).unwrap_or(0);
-                push_capped(&mut self.ttft_hist, ttft_ms);
-            }
+        if !self.done
+            && let Some(ref r) = self.report
+        {
+            push_capped(
+                &mut self.tps_hist,
+                r.turns.aggregate_tps.unwrap_or(0.0).round() as u64,
+            );
+            let ttft_ms = r.turns.ttft.map(|t| t.avg.round() as u64).unwrap_or(0);
+            push_capped(&mut self.ttft_hist, ttft_ms);
         }
     }
 
@@ -425,6 +431,11 @@ impl TuiState {
         }
         rows.truncate(MAX_CONV_ROWS);
         rows
+    }
+
+    /// Total number of conversations (completed + active), before the display cap.
+    fn total_conv_count(&self) -> usize {
+        self.completed_convs.len() + self.partial_convs.len()
     }
 
     /// Number of turns in the currently selected conversation (clamps the
@@ -469,7 +480,9 @@ impl TuiState {
         let status = if turn.success {
             Span::styled("✓ ok", Style::default().fg(Color::Green))
         } else {
-            let label = turn.error.map_or("✗ error".to_string(), |e| format!("✗ {e}"));
+            let label = turn
+                .error
+                .map_or("✗ error".to_string(), |e| format!("✗ {e}"));
             Span::styled(label, Style::default().fg(Color::Red))
         };
         let mut meta = String::new();
@@ -494,12 +507,7 @@ impl TuiState {
         lines.push(Line::from(""));
 
         // REQUEST — last user message by default, full payload when expanded.
-        let msgs = request_messages(
-            row.turns,
-            turn_idx,
-            &self.cfg_snap.seed_messages,
-            &self.cfg_snap.turn_prompt,
-        );
+        let msgs = request_messages(row.turns, turn_idx);
         if self.turn_expanded {
             lines.push(divider(format!(
                 "  ── REQUEST ({} messages · x to collapse) ",
@@ -538,9 +546,9 @@ impl TuiState {
                 _ => lines.push(Line::from(Span::styled("  (empty response)", dim))),
             }
         } else {
-            let label = turn
-                .error
-                .map_or("request failed".to_string(), |e| format!("request failed: {e}"));
+            let label = turn.error.map_or("request failed".to_string(), |e| {
+                format!("request failed: {e}")
+            });
             lines.push(Line::from(Span::styled(
                 format!("  {label}"),
                 Style::default().fg(Color::Red),
@@ -661,10 +669,9 @@ pub async fn replay(result: &GrowResult) -> Result<(), ProbeError> {
             Some(ev) = key_rx.recv() => {
                 if let Event::Key(k) = ev
                     && k.kind == KeyEventKind::Press
+                    && handle_key(&mut state, k.code, &no_pause)
                 {
-                    if handle_key(&mut state, k.code, &no_pause) {
-                        break;
-                    }
+                    break;
                 }
             }
             _ = ticker.tick() => {
@@ -775,7 +782,7 @@ fn draw(frame: &mut ratatui::Frame, state: &TuiState) {
     draw_header(frame, areas[0], state);
     draw_tiles(frame, areas[1], state);
     draw_sparklines(frame, areas[2], state);
-    draw_conversations(frame, areas[3], state, &rows);
+    draw_conversations(frame, areas[3], state, &rows, state.total_conv_count());
     draw_footer(frame, areas[4], state);
 
     if state.show_detail {
@@ -950,12 +957,25 @@ fn draw_sparklines(frame: &mut ratatui::Frame, area: Rect, state: &TuiState) {
     );
 }
 
-fn draw_conversations(frame: &mut ratatui::Frame, area: Rect, state: &TuiState, rows: &[ConvRow]) {
+fn draw_conversations(
+    frame: &mut ratatui::Frame,
+    area: Rect,
+    state: &TuiState,
+    rows: &[ConvRow],
+    total_conv_count: usize,
+) {
     let selected = state.selected.min(rows.len().saturating_sub(1));
 
     let header = Row::new([
-        "#", "slot", "turns", "state", "TTFT avg", "TPS avg",
-        "prompt-tok", "compl-tok", "terminal",
+        "#",
+        "slot",
+        "turns",
+        "state",
+        "TTFT avg",
+        "TPS avg",
+        "prompt-tok",
+        "compl-tok",
+        "terminal",
     ])
     .style(Style::default().fg(Color::DarkGray))
     .height(1);
@@ -970,18 +990,14 @@ fn draw_conversations(frame: &mut ratatui::Frame, area: Rect, state: &TuiState, 
                 Cell::from(Span::styled("✓ done", Style::default().fg(Color::Green)))
             };
             let terminal_cell = match &r.terminal {
-                Some(TerminalReason::ContextLimit) => Cell::from(Span::styled(
-                    "ctx-limit",
-                    Style::default().fg(Color::Green),
-                )),
+                Some(TerminalReason::ContextLimit) => {
+                    Cell::from(Span::styled("ctx-limit", Style::default().fg(Color::Green)))
+                }
                 Some(TerminalReason::MaxTurns) => Cell::from(Span::styled(
                     "max-turns",
                     Style::default().fg(Color::Yellow),
                 )),
-                Some(t) => Cell::from(Span::styled(
-                    t.to_string(),
-                    Style::default().fg(Color::Red),
-                )),
+                Some(t) => Cell::from(Span::styled(t.to_string(), Style::default().fg(Color::Red))),
                 None => Cell::from(dash),
             };
             let pt = if r.total_prompt_tokens > 0 {
@@ -999,7 +1015,10 @@ fn draw_conversations(frame: &mut ratatui::Frame, area: Rect, state: &TuiState, 
                 Cell::from(format!("[{}]", r.slot)),
                 Cell::from(r.turn_count.to_string()),
                 state_cell,
-                Cell::from(r.avg_ttft_ms.map_or(dash.to_string(), |v| format!("{v:.0}ms"))),
+                Cell::from(
+                    r.avg_ttft_ms
+                        .map_or(dash.to_string(), |v| format!("{v:.0}ms")),
+                ),
                 Cell::from(r.avg_tps.map_or(dash.to_string(), |v| format!("{v:.1}"))),
                 Cell::from(pt),
                 Cell::from(ct),
@@ -1034,6 +1053,15 @@ fn draw_conversations(frame: &mut ratatui::Frame, area: Rect, state: &TuiState, 
         Constraint::Length(10),
         Constraint::Min(9),
     ];
+    let mut table_rows = table_rows;
+    if total_conv_count > MAX_CONV_ROWS {
+        let hidden = total_conv_count - MAX_CONV_ROWS;
+        table_rows.push(Row::new(vec![Cell::from(Span::styled(
+            format!("  \u{2026} and {hidden} more conversations (use --output to see all)"),
+            Style::default().fg(Color::DarkGray),
+        ))]));
+    }
+
     let table = Table::new(table_rows, widths)
         .header(header)
         .block(panel(title))
@@ -1140,8 +1168,10 @@ fn draw_detail(frame: &mut ratatui::Frame, state: &TuiState, rows: &[ConvRow]) {
                 t.completion_tokens
                     .map_or(dash.to_string(), |v| thousands(u64::from(v))),
                 format!("{:.2}s", t.e2e.as_secs_f64()),
-                t.ttft
-                    .map_or(dash.to_string(), |d| format!("{:.0}ms", d.as_secs_f64() * 1000.0)),
+                t.ttft.map_or(dash.to_string(), |d| format!(
+                    "{:.0}ms",
+                    d.as_secs_f64() * 1000.0
+                )),
                 t.tpot_ms.map_or(dash.to_string(), |v| format!("{v:.1}ms")),
                 t.tps.map_or(dash.to_string(), |v| format!("{v:.1}")),
             )),
@@ -1286,29 +1316,56 @@ fn draw_help(frame: &mut ratatui::Frame) {
 
     let lines = vec![
         section("KEYS"),
-        key("↑/↓  j/k", "navigate conversations / turns / scroll request view"),
+        key(
+            "↑/↓  j/k",
+            "navigate conversations / turns / scroll request view",
+        ),
         key("g  G", "jump to top / bottom of the current list or view"),
-        key("enter", "drill in: conversation → turn list → request/response"),
-        key("x", "in request view: expand / collapse the full request payload"),
+        key(
+            "enter",
+            "drill in: conversation → turn list → request/response",
+        ),
+        key(
+            "x",
+            "in request view: expand / collapse the full request payload",
+        ),
         key("esc", "step back out one level"),
         key("s", "cycle sort: recent → turns → TTFT → TPS"),
         key("space / p", "pause / resume dispatch and freeze metrics"),
         key("?", "toggle this help overlay"),
-        key("q / Esc", "quit and restore terminal (report printed after)"),
+        key(
+            "q / Esc",
+            "quit and restore terminal (report printed after)",
+        ),
         Line::from(""),
         section("METRICS"),
-        term("TTFT", "time from request send to first content token (streaming)"),
-        term("TPOT", "(e2e − TTFT) / (tokens − 1) — per-step decode latency"),
+        term(
+            "TTFT",
+            "time from request send to first content token (streaming)",
+        ),
+        term(
+            "TPOT",
+            "(e2e − TTFT) / (tokens − 1) — per-step decode latency",
+        ),
         term("TPS per-req", "completion_tokens / decode_window in tok/s"),
-        term("TPS aggregate", "Σ completion_tokens / wall_clock (pause-excluded)"),
+        term(
+            "TPS aggregate",
+            "Σ completion_tokens / wall_clock (pause-excluded)",
+        ),
         term("p50 / p95 / p99", "percentiles across all successful turns"),
         Line::from(""),
         section("CONVERSATION STATES"),
         term("● active", "a slot is currently running turns"),
         term("✓ done", "conversation reached its terminal condition"),
-        term("ctx-limit", "server refused: context-length overflow (normal)"),
+        term(
+            "ctx-limit",
+            "server refused: context-length overflow (normal)",
+        ),
         term("max-turns", "stopped by --max-turns cap"),
-        term("error(…)", "network or API error terminated the conversation"),
+        term(
+            "error(…)",
+            "network or API error terminated the conversation",
+        ),
         Line::from(""),
         Line::from(Span::styled(
             "  press  ?  ·  Esc  ·  or  q  to close",
