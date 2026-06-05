@@ -1,5 +1,6 @@
 //! Console and JSON report renderer for a completed grow run.
 
+use crate::fmt::thousands;
 use crate::metrics::{
     ConvStats, DegradationBucket, GrowResult, LatencyStats, TurnStats, aggregate,
 };
@@ -174,19 +175,6 @@ fn push(out: &mut String, line: String) {
     out.push('\n');
 }
 
-fn thousands(n: u64) -> String {
-    let s = n.to_string();
-    let bytes = s.as_bytes();
-    let mut out = String::with_capacity(s.len() + s.len() / 3);
-    for (i, b) in bytes.iter().enumerate() {
-        if i > 0 && (bytes.len() - i).is_multiple_of(3) {
-            out.push(',');
-        }
-        out.push(*b as char);
-    }
-    out
-}
-
 // ── JSON output ───────────────────────────────────────────────────────────────
 
 #[derive(Serialize)]
@@ -284,15 +272,3 @@ pub fn render_json(result: &GrowResult) -> Result<String, serde_json::Error> {
     serde_json::to_string_pretty(&doc)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn thousands_groups() {
-        assert_eq!(thousands(0), "0");
-        assert_eq!(thousands(999), "999");
-        assert_eq!(thousands(2560), "2,560");
-        assert_eq!(thousands(1_000_000), "1,000,000");
-    }
-}

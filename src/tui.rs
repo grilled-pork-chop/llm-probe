@@ -2,6 +2,7 @@
 
 use crate::config::RunConfig;
 use crate::error::ProbeError;
+use crate::fmt::thousands;
 use crate::metrics::{
     aggregate, mean, ConfigSnapshot, ConversationOutcome, GrowResult, RunReport, TerminalReason,
     TurnOutcome,
@@ -38,6 +39,14 @@ struct TerminalGuard;
 
 impl TerminalGuard {
     fn enter() -> Result<Self, ProbeError> {
+        // Restore the terminal on panic before the default hook prints, so a
+        // crash never leaves the user in raw mode on the alternate screen.
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            let _ = disable_raw_mode();
+            let _ = execute!(io::stdout(), LeaveAlternateScreen);
+            prev(info);
+        }));
         enable_raw_mode().map_err(io_err)?;
         execute!(io::stdout(), EnterAlternateScreen).map_err(io_err)?;
         Ok(Self)
@@ -74,6 +83,16 @@ struct ConvRow {
     total_completion_tokens: u64,
     terminal: Option<TerminalReason>,
     turns: Vec<TurnOutcome>,
+}
+
+/// Mutually exclusive display phase, derived once from the underlying flags so
+/// the precedence (replay > paused > done > live) lives in a single place.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Phase {
+    Live,
+    Paused,
+    Done,
+    Replay,
 }
 
 struct TuiState {
@@ -158,6 +177,19 @@ impl TuiState {
 
     fn infinite(&self) -> bool {
         self.total_conversations == 0
+    }
+
+    /// Current display phase. Precedence is defined here and nowhere else.
+    fn phase(&self) -> Phase {
+        if self.is_replay {
+            Phase::Replay
+        } else if self.paused {
+            Phase::Paused
+        } else if self.done {
+            Phase::Done
+        } else {
+            Phase::Live
+        }
     }
 
     /// Wall-clock used for rate metrics.
@@ -333,13 +365,6 @@ fn push_capped(buf: &mut VecDeque<u64>, v: u64) {
 
 /// Run the live grow-mode TUI and return the authoritative `GrowResult`.
 pub async fn run(cfg: &RunConfig) -> Result<GrowResult, ProbeError> {
-    let prev_hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |info| {
-        let _ = disable_raw_mode();
-        let _ = execute!(io::stdout(), LeaveAlternateScreen);
-        prev_hook(info);
-    }));
-
     let _guard = TerminalGuard::enter()?;
     let backend = CrosstermBackend::new(io::stdout());
     let mut terminal = Terminal::new(backend).map_err(io_err)?;
@@ -402,13 +427,6 @@ pub async fn run(cfg: &RunConfig) -> Result<GrowResult, ProbeError> {
 
 /// Open an interactive replay of a saved `GrowResult` (no HTTP requests made).
 pub async fn replay(result: &GrowResult) -> Result<(), ProbeError> {
-    let prev_hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |info| {
-        let _ = disable_raw_mode();
-        let _ = execute!(io::stdout(), LeaveAlternateScreen);
-        prev_hook(info);
-    }));
-
     let _guard = TerminalGuard::enter()?;
     let backend = CrosstermBackend::new(io::stdout());
     let mut terminal = Terminal::new(backend).map_err(io_err)?;
@@ -537,14 +555,11 @@ fn panel(title: &str) -> Block<'_> {
 
 fn draw_header(frame: &mut ratatui::Frame, area: Rect, state: &TuiState) {
     let elapsed = state.elapsed().as_secs_f64();
-    let (mode_str, mode_fg, mode_bg) = if state.is_replay {
-        (" REPLAY ", ACCENT, Color::Reset)
-    } else if state.paused {
-        (" PAUSED ", Color::Black, Color::Yellow)
-    } else if state.done {
-        ("  DONE  ", Color::Black, Color::Green)
-    } else {
-        ("  LIVE  ", Color::Black, Color::Green)
+    let (mode_str, mode_fg, mode_bg) = match state.phase() {
+        Phase::Replay => (" REPLAY ", ACCENT, Color::Reset),
+        Phase::Paused => (" PAUSED ", Color::Black, Color::Yellow),
+        Phase::Done => ("  DONE  ", Color::Black, Color::Green),
+        Phase::Live => ("  LIVE  ", Color::Black, Color::Green),
     };
 
     let line = Line::from(vec![
@@ -638,7 +653,7 @@ fn draw_tiles(frame: &mut ratatui::Frame, area: Rect, state: &TuiState) {
     };
     frame.render_widget(
         Paragraph::new(vec![
-            tile_line(fmt_thousands(total_tok), "compl tokens"),
+            tile_line(thousands(total_tok), "compl tokens"),
             tile_line(format!("{ok_turns}/{total_turns}"), "turns ok/total"),
             tile_line(target, "target convs"),
         ])
@@ -714,12 +729,12 @@ fn draw_conversations(frame: &mut ratatui::Frame, area: Rect, state: &TuiState) 
                 None => Cell::from(dash),
             };
             let pt = if r.total_prompt_tokens > 0 {
-                fmt_thousands(r.total_prompt_tokens)
+                thousands(r.total_prompt_tokens)
             } else {
                 dash.to_string()
             };
             let ct = if r.total_completion_tokens > 0 {
-                fmt_thousands(r.total_completion_tokens)
+                thousands(r.total_completion_tokens)
             } else {
                 dash.to_string()
             };
@@ -742,12 +757,14 @@ fn draw_conversations(frame: &mut ratatui::Frame, area: Rect, state: &TuiState) 
         ts.select(Some(selected));
     }
 
-    let title = if state.is_replay {
-        "conversations [REPLAY] — ↑/↓ select  ·  enter: turn detail  ·  q quit"
-    } else if state.paused {
-        "conversations [PAUSED] — ↑/↓ select  ·  enter: turn detail  ·  space: resume"
-    } else {
-        "conversations — ↑/↓ select  ·  enter: turn detail  ·  space: pause"
+    let title = match state.phase() {
+        Phase::Replay => "conversations [REPLAY] — ↑/↓ select  ·  enter: turn detail  ·  q quit",
+        Phase::Paused => {
+            "conversations [PAUSED] — ↑/↓ select  ·  enter: turn detail  ·  space: resume"
+        }
+        Phase::Done | Phase::Live => {
+            "conversations — ↑/↓ select  ·  enter: turn detail  ·  space: pause"
+        }
     };
 
     let widths = [
@@ -847,9 +864,9 @@ fn draw_detail(frame: &mut ratatui::Frame, state: &TuiState) {
                 "  {:>4}  {:>10}  {:>10}  {:>7}  {:>7}  {:>8}  {:>7}  ",
                 t.turn_idx + 1,
                 t.prompt_tokens
-                    .map_or(dash.to_string(), |v| fmt_thousands(u64::from(v))),
+                    .map_or(dash.to_string(), |v| thousands(u64::from(v))),
                 t.completion_tokens
-                    .map_or(dash.to_string(), |v| fmt_thousands(u64::from(v))),
+                    .map_or(dash.to_string(), |v| thousands(u64::from(v))),
                 format!("{:.2}s", t.e2e.as_secs_f64()),
                 t.ttft
                     .map_or(dash.to_string(), |d| format!("{:.0}ms", d.as_secs_f64() * 1000.0)),
@@ -881,29 +898,27 @@ fn draw_detail(frame: &mut ratatui::Frame, state: &TuiState) {
 }
 
 fn draw_footer(frame: &mut ratatui::Frame, area: Rect, state: &TuiState) {
-    if state.paused && !state.is_replay {
-        let line = Line::from(vec![
-            Span::styled(
-                " PAUSED ",
-                Style::default()
-                    .fg(Color::Black)
-                    .bg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                "  space/p resume  ·  ↑/↓ select  ·  enter detail  ·  q quit  ·  ? help",
-                Style::default().fg(Color::DarkGray),
-            ),
-        ]);
-        frame.render_widget(Paragraph::new(line), area);
-        return;
-    }
-    let text = if state.is_replay {
-        " [REPLAY]  q / esc quit  ·  ↑/↓ select  ·  enter detail  ·  ? help"
-    } else if state.done {
-        " [DONE]  q quit  ·  ↑/↓ select  ·  enter detail  ·  ? help"
-    } else {
-        " q quit  ·  space/p pause  ·  ↑/↓ select  ·  enter detail  ·  ? help"
+    let text = match state.phase() {
+        Phase::Paused => {
+            let line = Line::from(vec![
+                Span::styled(
+                    " PAUSED ",
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    "  space/p resume  ·  ↑/↓ select  ·  enter detail  ·  q quit  ·  ? help",
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ]);
+            frame.render_widget(Paragraph::new(line), area);
+            return;
+        }
+        Phase::Replay => " [REPLAY]  q / esc quit  ·  ↑/↓ select  ·  enter detail  ·  ? help",
+        Phase::Done => " [DONE]  q quit  ·  ↑/↓ select  ·  enter detail  ·  ? help",
+        Phase::Live => " q quit  ·  space/p pause  ·  ↑/↓ select  ·  enter detail  ·  ? help",
     };
     frame.render_widget(
         Paragraph::new(text).style(Style::default().fg(Color::DarkGray)),
@@ -997,17 +1012,4 @@ fn ms_val(v: Option<f64>) -> String {
 
 fn tps_val(v: Option<f64>) -> String {
     v.map_or_else(|| "—".to_string(), |x| format!("{x:.1}"))
-}
-
-fn fmt_thousands(n: u64) -> String {
-    let s = n.to_string();
-    let bytes = s.as_bytes();
-    let mut out = String::with_capacity(s.len() + s.len() / 3);
-    for (i, b) in bytes.iter().enumerate() {
-        if i > 0 && (bytes.len() - i).is_multiple_of(3) {
-            out.push(',');
-        }
-        out.push(*b as char);
-    }
-    out
 }
