@@ -52,7 +52,7 @@ pub struct Args {
     pub max_turns: usize,
 
     /// Cap output tokens per turn.
-    #[arg(long, default_value_t = 128)]
+    #[arg(long, default_value_t = 2048)]
     pub max_tokens: u32,
 
     /// Sampling temperature (omitted from the request when unset).

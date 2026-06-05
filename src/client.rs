@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc::UnboundedSender;
 
 const ERR_BODY_LIMIT: usize = 512;
-const BODY_LIMIT: usize = 8192;
+const BODY_LIMIT: usize = 65536;
 
 fn cap_body(s: String) -> String {
     if s.chars().count() <= BODY_LIMIT {
