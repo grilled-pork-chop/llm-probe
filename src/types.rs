@@ -48,6 +48,7 @@ pub struct Choice {
 #[derive(Debug, Deserialize)]
 pub struct AssistantMsg {
     pub content: Option<String>,
+    pub reasoning: Option<String>,
 }
 
 /// Token accounting from the API's `usage` field — our only token source.
@@ -76,4 +77,5 @@ pub struct DeltaChoice {
 #[derive(Debug, Deserialize)]
 pub struct Delta {
     pub content: Option<String>,
+    pub reasoning: Option<String>,
 }
