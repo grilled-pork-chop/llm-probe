@@ -29,7 +29,11 @@ use tokio::sync::mpsc::unbounded_channel;
 use tokio::sync::watch;
 
 const ACCENT: Color = Color::Cyan;
+/// Redraw cadence — kept fast so keypresses echo immediately.
 const TICK: Duration = Duration::from_millis(80);
+/// Aggregate-recompute cadence. The full report is O(all turns), so it runs
+/// at a lower rate than the redraw rather than on every frame.
+const REPORT_TICK: Duration = Duration::from_millis(240);
 const SPARK_LEN: usize = 60;
 const MAX_CONV_ROWS: usize = 500;
 
@@ -72,7 +76,7 @@ struct PartialConv {
     turns: Vec<TurnOutcome>,
 }
 
-struct ConvRow {
+struct ConvRow<'a> {
     conv_id: usize,
     slot: usize,
     turn_count: usize,
@@ -82,7 +86,35 @@ struct ConvRow {
     total_prompt_tokens: u64,
     total_completion_tokens: u64,
     terminal: Option<TerminalReason>,
-    turns: Vec<TurnOutcome>,
+    /// Borrowed from the owning conversation — never cloned per frame.
+    turns: &'a [TurnOutcome],
+}
+
+/// Build a display row by summarising a conversation's turns. Borrows `turns`.
+fn build_row(
+    conv_id: usize,
+    slot: usize,
+    turns: &[TurnOutcome],
+    active: bool,
+    terminal: Option<TerminalReason>,
+) -> ConvRow<'_> {
+    let ok = || turns.iter().filter(|t| t.success);
+    let ttft: Vec<f64> = ok()
+        .filter_map(|t| t.ttft.map(|d| d.as_secs_f64() * 1000.0))
+        .collect();
+    let tps: Vec<f64> = ok().filter_map(|t| t.tps).collect();
+    ConvRow {
+        conv_id,
+        slot,
+        turn_count: turns.len(),
+        active,
+        avg_ttft_ms: mean(&ttft),
+        avg_tps: mean(&tps),
+        total_prompt_tokens: ok().filter_map(|t| t.prompt_tokens).map(u64::from).sum(),
+        total_completion_tokens: ok().filter_map(|t| t.completion_tokens).map(u64::from).sum(),
+        terminal,
+        turns,
+    }
 }
 
 /// Mutually exclusive display phase, derived once from the underlying flags so
@@ -102,6 +134,8 @@ struct TuiState {
     partial_convs: BTreeMap<usize, PartialConv>,
     completed_convs: Vec<ConversationOutcome>,
     report: Option<RunReport>,
+    /// When the aggregate report was last recomputed (throttled to REPORT_TICK).
+    last_report: Instant,
     tps_hist: VecDeque<u64>,
     ttft_hist: VecDeque<u64>,
     selected: usize,
@@ -135,6 +169,7 @@ impl TuiState {
             partial_convs: BTreeMap::new(),
             completed_convs: Vec::new(),
             report: None,
+            last_report: Instant::now(),
             tps_hist: VecDeque::with_capacity(SPARK_LEN),
             ttft_hist: VecDeque::with_capacity(SPARK_LEN),
             selected: 0,
@@ -158,6 +193,7 @@ impl TuiState {
             partial_convs: BTreeMap::new(),
             completed_convs: result.conversations.clone(),
             report: None,
+            last_report: Instant::now(),
             tps_hist: VecDeque::with_capacity(SPARK_LEN),
             ttft_hist: VecDeque::with_capacity(SPARK_LEN),
             selected: 0,
@@ -276,6 +312,12 @@ impl TuiState {
         if self.paused {
             return;
         }
+        // Throttle the O(all turns) aggregate to REPORT_TICK; the redraw itself
+        // keeps running at the faster TICK rate for input responsiveness.
+        if self.report.is_some() && self.last_report.elapsed() < REPORT_TICK {
+            return;
+        }
+        self.last_report = Instant::now();
         self.recompute_report();
         if !self.done {
             if let Some(ref r) = self.report {
@@ -289,65 +331,20 @@ impl TuiState {
         }
     }
 
-    fn conv_rows(&self) -> Vec<ConvRow> {
+    fn conv_rows(&self) -> Vec<ConvRow<'_>> {
         let mut rows: Vec<ConvRow> = Vec::new();
-
         for conv in &self.completed_convs {
-            let ok: Vec<&TurnOutcome> = conv.turns.iter().filter(|t| t.success).collect();
-            rows.push(ConvRow {
-                conv_id: conv.id,
-                slot: conv.slot,
-                turn_count: conv.turns.len(),
-                active: false,
-                avg_ttft_ms: mean(
-                    &ok.iter()
-                        .filter_map(|t| t.ttft.map(|d| d.as_secs_f64() * 1000.0))
-                        .collect::<Vec<_>>(),
-                ),
-                avg_tps: mean(&ok.iter().filter_map(|t| t.tps).collect::<Vec<_>>()),
-                total_prompt_tokens: ok
-                    .iter()
-                    .filter_map(|t| t.prompt_tokens)
-                    .map(u64::from)
-                    .sum(),
-                total_completion_tokens: ok
-                    .iter()
-                    .filter_map(|t| t.completion_tokens)
-                    .map(u64::from)
-                    .sum(),
-                terminal: Some(conv.terminal.clone()),
-                turns: conv.turns.clone(),
-            });
+            rows.push(build_row(
+                conv.id,
+                conv.slot,
+                &conv.turns,
+                false,
+                Some(conv.terminal.clone()),
+            ));
         }
-
         for p in self.partial_convs.values() {
-            let ok: Vec<&TurnOutcome> = p.turns.iter().filter(|t| t.success).collect();
-            rows.push(ConvRow {
-                conv_id: p.conv_id,
-                slot: p.slot,
-                turn_count: p.turns.len(),
-                active: true,
-                avg_ttft_ms: mean(
-                    &ok.iter()
-                        .filter_map(|t| t.ttft.map(|d| d.as_secs_f64() * 1000.0))
-                        .collect::<Vec<_>>(),
-                ),
-                avg_tps: mean(&ok.iter().filter_map(|t| t.tps).collect::<Vec<_>>()),
-                total_prompt_tokens: ok
-                    .iter()
-                    .filter_map(|t| t.prompt_tokens)
-                    .map(u64::from)
-                    .sum(),
-                total_completion_tokens: ok
-                    .iter()
-                    .filter_map(|t| t.completion_tokens)
-                    .map(u64::from)
-                    .sum(),
-                terminal: None,
-                turns: p.turns.clone(),
-            });
+            rows.push(build_row(p.conv_id, p.slot, &p.turns, true, None));
         }
-
         rows.sort_by(|a, b| b.conv_id.cmp(&a.conv_id));
         rows.truncate(MAX_CONV_ROWS);
         rows
@@ -529,14 +526,17 @@ fn draw(frame: &mut ratatui::Frame, state: &TuiState) {
     ])
     .split(frame.area());
 
+    // Built once per frame and shared by the table and the detail modal.
+    let rows = state.conv_rows();
+
     draw_header(frame, areas[0], state);
     draw_tiles(frame, areas[1], state);
     draw_sparklines(frame, areas[2], state);
-    draw_conversations(frame, areas[3], state);
+    draw_conversations(frame, areas[3], state, &rows);
     draw_footer(frame, areas[4], state);
 
     if state.show_detail {
-        draw_detail(frame, state);
+        draw_detail(frame, state, &rows);
     }
     if state.show_help {
         draw_help(frame);
@@ -693,8 +693,7 @@ fn draw_sparklines(frame: &mut ratatui::Frame, area: Rect, state: &TuiState) {
     );
 }
 
-fn draw_conversations(frame: &mut ratatui::Frame, area: Rect, state: &TuiState) {
-    let rows = state.conv_rows();
+fn draw_conversations(frame: &mut ratatui::Frame, area: Rect, state: &TuiState, rows: &[ConvRow]) {
     let selected = state.selected.min(rows.len().saturating_sub(1));
 
     let header = Row::new([
@@ -790,8 +789,7 @@ fn draw_conversations(frame: &mut ratatui::Frame, area: Rect, state: &TuiState) 
     frame.render_stateful_widget(table, area, &mut ts);
 }
 
-fn draw_detail(frame: &mut ratatui::Frame, state: &TuiState) {
-    let rows = state.conv_rows();
+fn draw_detail(frame: &mut ratatui::Frame, state: &TuiState, rows: &[ConvRow]) {
     let selected = state.selected.min(rows.len().saturating_sub(1));
     let Some(row) = rows.get(selected) else {
         return;
@@ -851,7 +849,7 @@ fn draw_detail(frame: &mut ratatui::Frame, state: &TuiState) {
         dim,
     )));
 
-    for t in &row.turns {
+    for t in row.turns {
         let dash = "—";
         let status_span = if t.success {
             Span::styled("✓ ok", Style::default().fg(Color::Green))
